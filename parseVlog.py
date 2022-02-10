@@ -71,13 +71,15 @@ def parseVlog(vlog):
     recompMethods = set() # set for computing the number of recompilations
     numRecomp = 0
     lastTimeStamp = 0
+    veryLongCompilations = []
+    compilationWasDisabled = False
 
     #  (cold) Compiling java/lang/Double.longBitsToDouble(J)D  OrdinaryMethod j9m=0000000000097B18 t=20 compThreadID=0 memLimit=262144 KB freePhysicalMemory=75755 MB
     compStartPattern = re.compile('^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
     # + (cold) sun/reflect/Reflection.getCallerClass()Ljava/lang/Class; @ 00007FB21300003C-00007FB213000167 OrdinaryMethod - Q_SZ=1 Q_SZI=1 QW=2 j9m=000000000004D1D8 bcsz=2 JNI time=995us mem=[region=704 system=2048]KB compThreadID=0 CpuLoad=163%(10%avg) JvmCpu=0%
     compEndPattern  = re.compile('^\+ \((.+)\) (\S+) \@ (0x)?([0-9A-F]+)-(0x)?([0-9A-F]+).+ Q_SZ=(\d+).+ time=(\d+)us')
     # ! (cold) java/nio/Buffer.<init>(IIII)V Q_SZ=274 Q_SZI=274 QW=275 j9m=00000000000B3970 time=99us compilationAotClassReloFailure memLimit=206574 KB freePhysicalMemory=205 MB mem=[region=64 system=2048]KB compThreadID=0
-    compFailPattern = re.compile('^\! \(.+\) (\S+).+Q_SZ=(\d+).+ time=(\d+)us (\S+) ')
+    compFailPattern = re.compile('^\! \(.+\) (\S+) \s*time=(\d+)us (\S+) ')
     jvmCpuPattern = re.compile('^.+jvmCPU=(\d+)', re.IGNORECASE)
     freeMemPattern = re.compile('^.+freePhysicalMemory=(\d+) MB')
     scratchMemPattern = re.compile('^.+mem=\[region=(\d+) system=(\d+)\]KB')
@@ -97,7 +99,7 @@ def parseVlog(vlog):
                 opt = "jni"
             # print very long compilations
             if usec > compTimeThreshold:
-                print(line)
+                veryLongCompilations.append(line)
 
             if usec > maxCompTime:
                 maxCompTime = usec
@@ -146,13 +148,11 @@ def parseVlog(vlog):
 
         else: # Check for compilation failures
             if line.startswith("!"):
-                print("Failure:", line)
                 m = compFailPattern.match(line)
                 if m:
                     methodName = m.group(1)
-                    qSZ = int(m.group(2))
-                    usec = int(m.group(3))
-                    failureReason = m.group(4)
+                    usec = int(m.group(2))
+                    failureReason = m.group(3)
                     levelName = " fail" # Treat compilation failures as a separate opt level
                     if levelName in compTimesPerLevel:
                         compTimesPerLevel[levelName].append(usec)
@@ -163,11 +163,20 @@ def parseVlog(vlog):
                     # Track methods that failed to compile
                     failedMethods.add(methodName)
 
-                    maxQSZ = max(maxQSZ, qSZ)
+                    # Get the Q_SZ if it exists
+                    match = re.search(r"Q_SZ=(\d+)", line)
+                    if match:
+                        qSZ = match.group(1)
+                        maxQSZ = max(maxQSZ, qSZ)
                 else:
                     # Failure line that is not matched could look like 
                     # ! sun/misc/Unsafe.ensureClassInitialized(Ljava/lang/Class;)V cannot be translated
-                    print(line)
+                    # <clinit> is in this category as well
+                    if re.search(r"cannot be translated$", line):
+                        failureReason = "uncompilable"
+                        failureHash[failureReason] = failureHash.get(failureReason, 0) + 1
+                    else:
+                        print(line)
             else: # Look for compilation starts that have the current timestamp
                 m = compStartPattern.match(line)
                 if m:
@@ -192,6 +201,8 @@ def parseVlog(vlog):
             maxRegionMem = max(maxRegionMem, regionMem)
         if "Low On Physical Memory" in line: # JIT aborts the compilation if this is seen
             numLowPhysicalMemEvents += 1
+        if "Disable further compilation" in line:
+            compilationWasDisabled = True
 
 
     # Print statistics
@@ -213,7 +224,7 @@ def parseVlog(vlog):
     print("GCR recomp    =", numGCR)
     print("Sync          =", numSync)
     print("DLT           =", numDLT)
-    print("Remote        =", numRemote, " Deserialized =", numDeserialized, " LocalNonAOTLoad =", numLocalNonAOTLoad)
+    print("Remote        =", numRemote, " Deserialized =", numDeserialized, " Local-Non-AOTLoad =", numLocalNonAOTLoad)
     print("MAX Q_SZ      =", maxQSZ)
     print("MAX JvmCPU    =", maxJvmCPU, "%")
     print("MaxScratchMem =", maxScratchMem, "KB")
@@ -226,6 +237,12 @@ def parseVlog(vlog):
         for method in failedMethods:
             print(method)
     print("LastTimeStamp =", lastTimeStamp, "ms")
+    if len(veryLongCompilations) > 0:
+        print("\nVery long compilations:")
+        for l in veryLongCompilations:
+            print(l)
+    if compilationWasDisabled:
+        print("WARNING: compilation was disabled at some point during JVM lifetime")
 ###################################################
 
 

@@ -73,13 +73,14 @@ def parseVlog(vlog):
     lastTimeStamp = 0
     veryLongCompilations = []
     compilationWasDisabled = False
+    numInterpreted = 0 # number of messages "will continue as interpreted"
 
     #  (cold) Compiling java/lang/Double.longBitsToDouble(J)D  OrdinaryMethod j9m=0000000000097B18 t=20 compThreadID=0 memLimit=262144 KB freePhysicalMemory=75755 MB
     compStartPattern = re.compile('^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
     # + (cold) sun/reflect/Reflection.getCallerClass()Ljava/lang/Class; @ 00007FB21300003C-00007FB213000167 OrdinaryMethod - Q_SZ=1 Q_SZI=1 QW=2 j9m=000000000004D1D8 bcsz=2 JNI time=995us mem=[region=704 system=2048]KB compThreadID=0 CpuLoad=163%(10%avg) JvmCpu=0%
     compEndPattern  = re.compile('^\+ \((.+)\) (\S+) \@ (0x)?([0-9A-F]+)-(0x)?([0-9A-F]+).+ Q_SZ=(\d+).+ time=(\d+)us')
     # ! (cold) java/nio/Buffer.<init>(IIII)V Q_SZ=274 Q_SZI=274 QW=275 j9m=00000000000B3970 time=99us compilationAotClassReloFailure memLimit=206574 KB freePhysicalMemory=205 MB mem=[region=64 system=2048]KB compThreadID=0
-    compFailPattern = re.compile('^\! \(.+\) (\S+) \s*time=(\d+)us (\S+) ')
+    compFailPattern = re.compile('^\! \(.+\) (\S+) .*time=(\d+)us (\S+) ')
     jvmCpuPattern = re.compile('^.+jvmCPU=(\d+)', re.IGNORECASE)
     freeMemPattern = re.compile('^.+freePhysicalMemory=(\d+) MB')
     scratchMemPattern = re.compile('^.+mem=\[region=(\d+) system=(\d+)\]KB')
@@ -166,7 +167,7 @@ def parseVlog(vlog):
                     # Get the Q_SZ if it exists
                     match = re.search(r"Q_SZ=(\d+)", line)
                     if match:
-                        qSZ = match.group(1)
+                        qSZ = int(match.group(1))
                         maxQSZ = max(maxQSZ, qSZ)
                 else:
                     # Failure line that is not matched could look like 
@@ -203,6 +204,8 @@ def parseVlog(vlog):
             numLowPhysicalMemEvents += 1
         if "Disable further compilation" in line:
             compilationWasDisabled = True
+        if "will continue as interpreted" in line:
+            numInterpreted += 1
 
 
     # Print statistics
@@ -243,6 +246,8 @@ def parseVlog(vlog):
             print(l)
     if compilationWasDisabled:
         print("WARNING: compilation was disabled at some point during JVM lifetime")
+    if numInterpreted > 0:
+        print(numInterpreted, "methods will continue as interpreted")
 ###################################################
 
 

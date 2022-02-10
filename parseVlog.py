@@ -70,7 +70,7 @@ def parseVlog(vlog):
     failedMethods = set() # set for tracking whether methods remain interpreted after a failure
     recompMethods = set() # set for computing the number of recompilations
     numRecomp = 0
-    lastTimeStamp = 0
+    crtTimeMs = 0 # current time in millis since the start of the JVM
     veryLongCompilations = []
     compilationWasDisabled = False
     numInterpreted = 0 # number of messages "will continue as interpreted"
@@ -184,7 +184,12 @@ def parseVlog(vlog):
                     opt = m.group(1)
                     methodName = m.group(2)
                     ms = int(m.group(3))
-                    lastTimeStamp = ms
+                    crtTimeMs = ms
+                else: # Other lines may contain time as well
+                    match = re.search(r"\st=\s*(\d+)", line)
+                    if match:
+                        crtTimeMs = int(match.group(1))
+                
 
         m = jvmCpuPattern.match(line)
         if m:
@@ -239,7 +244,7 @@ def parseVlog(vlog):
         print("Methods that remain interpreted after a failure:")
         for method in failedMethods:
             print(method)
-    print("LastTimeStamp =", lastTimeStamp, "ms")
+    print("LastTimeStamp =", crtTimeMs, "ms")
     if len(veryLongCompilations) > 0:
         print("\nVery long compilations:")
         for l in veryLongCompilations:

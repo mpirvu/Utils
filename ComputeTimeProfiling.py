@@ -9,6 +9,8 @@
 import re # for regular expressions
 import sys # for accessing parameters and exit
 
+profilingTimeThreshold = 2000 # ms. Method spending more than this in profiling, will be printed
+
 # We will keep a dictionary where the key is the method name and the value
 # is a list of hashes. Those hashes have 4 keys
 # 1. 'optLevel': The opt level of the compilation (includes "profiling" for profiling compilations)
@@ -87,15 +89,26 @@ def parseVlog(vlog, methodHash):
                     assert 'tComp' in compList[-1], "lastEntry for this method must be a compilation with start and end. Line: {l}".format(l=line)
                     compList.append({'optLevel':opt, 'tStart':ms})
 
+def printStatsHeader():
+    print("                       \tSamples\tTOTAL(sec)\tMIN(ms)\tAVG(ms)\tMAX(ms)")
+
+def printStats(name, dataList):
+    numSamples = len(dataList)
+    sumValue = sum(dataList)
+    meanValue = sumValue/numSamples
+    minValue = min(dataList)
+    maxValue = max(dataList)
+    print("{name}\t{n:7d}\t{s:8.0f}\t{min:7.0f}\t{avg:7.0f}\t{max:7.0f}".format(name=name, n=numSamples, s=sumValue/1000, min=minValue, avg=meanValue, max=maxValue))
 
 '''
-Walk the give method hash and for each method present determine
+Walk the give method hash and for each method determine
 1. If the method remains in profiling (last successful compilation is profiling)
 2. How much time is spent in profiling mode
+If time spent in profiling exceeds the given threshold, print that method name
 '''
-def walkMethodHash(methodHash):
+def walkMethodHash(methodHash, profTimeThreshold):
 
-    totalTimeProfiling = 0
+    timesSpentProfiling = [] # one entry for each method that spent time in profiling mode
     for method in methodHash:
         compList = methodHash[method]
         prevCompWasProfiling = False
@@ -132,9 +145,11 @@ def walkMethodHash(methodHash):
             print("Stuck in profiling for method", method)
             printMethodCompHistory(method, compList)
         if atLeastOneProfilingComp:
-            totalTimeProfiling += profilingTime
-            print("Spent", profilingTime, "ms profiling for method", method)
-    print("Total time spent profiling:", totalTimeProfiling, "ms")
+            timesSpentProfiling.append(profilingTime)
+            if profilingTime > profTimeThreshold:
+                print("Spent", profilingTime, "ms profiling for method", method)
+    printStatsHeader()
+    printStats("Time-Spent-Profiling-ms", timesSpentProfiling)
 
 
 # Get the name of vlog
@@ -147,4 +162,4 @@ vlogFileName = str(sys.argv[1])
 Vlog = open(vlogFileName, 'r', 1)
 methodHash = {}
 parseVlog(Vlog, methodHash)
-walkMethodHash(methodHash)
+walkMethodHash(methodHash, profilingTimeThreshold)

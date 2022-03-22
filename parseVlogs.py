@@ -6,12 +6,10 @@
 
 import re # for regular expressions
 import sys # for accessing parameters and exit
-import statistics
 import glob
 
-# Compilations that take more than this value (in usec) are printed on screen
-compTimeThreshold = 10000000
-
+# The following boolean controls whether vlog parsing should stop after JVM detects end of start-up
+analyzeOnlyStartup = False
 
 # Dictionary that maps opt levels from vlog into shorter names
 knownOptLevels = {
@@ -76,8 +74,11 @@ def parseVlog(vlog):
     compEndPattern  = re.compile('^\+ \((.+)\) (\S+) \@ (0x)?([0-9A-F]+)-(0x)?([0-9A-F]+).+ Q_SZ=(\d+).+ time=(\d+)us')
     # ! (cold) java/nio/Buffer.<init>(IIII)V Q_SZ=274 Q_SZI=274 QW=275 j9m=00000000000B3970 time=99us compilationAotClassReloFailure memLimit=206574 KB freePhysicalMemory=205 MB mem=[region=64 system=2048]KB compThreadID=0
     compFailPattern = re.compile('^\! \(.+\) (\S+) .*time=(\d+)us (\S+) ')
+
     # Parse the vlog
     for line in vlog:
+        if analyzeOnlyStartup and "VM changed state to NOT_STARTUP" in line:
+            break
         m = compEndPattern.match(line)
         if m:
             # First group is the opt level

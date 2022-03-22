@@ -7,10 +7,11 @@
 import operator # for sorting the dictionary
 import re # for regular expressions
 import sys # for accessing parameters and exit
-import statistics
 
 # Compilations that take more than this value (in usec) are printed on screen
 compTimeThreshold = 10000000
+# The following boolean controls whether vlog parsing should stop after JVM detects end of start-up
+analyzeOnlyStartup = False
 
 
 # Dictionary that maps opt levels from vlog into shorter names
@@ -86,7 +87,8 @@ def parseVlog(vlog):
     scratchMemPattern = re.compile('^.+mem=\[region=(\d+) system=(\d+)\]KB')
     # Parse the vlog
     for line in vlog:
-        matchFound = False
+        if analyzeOnlyStartup and "VM changed state to NOT_STARTUP" in line:
+            break
         m = compEndPattern.match(line)
         if m:
             # First group is the opt level
@@ -170,7 +172,7 @@ def parseVlog(vlog):
                         qSZ = int(match.group(1))
                         maxQSZ = max(maxQSZ, qSZ)
                 else:
-                    # Failure line that is not matched could look like 
+                    # Failure line that is not matched could look like
                     # ! sun/misc/Unsafe.ensureClassInitialized(Ljava/lang/Class;)V cannot be translated
                     # <clinit> is in this category as well
                     if re.search(r"cannot be translated$", line):
@@ -189,7 +191,7 @@ def parseVlog(vlog):
                     match = re.search(r"\st=\s*(\d+)", line)
                     if match:
                         crtTimeMs = int(match.group(1))
-                
+
 
         m = jvmCpuPattern.match(line)
         if m:

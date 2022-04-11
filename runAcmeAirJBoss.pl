@@ -24,10 +24,10 @@ my @WASServers =
       {
       instanceName      => "acmeair",
       port              => 8443,
-      wasCPUAffinity    => "0x33", # 0xf means 4 full cores. The HT counterpart is not utilized
+      wasCPUAffinity    => "numactl -C 0,1,4,5",
       firstCustomerId   => 0,
       lastCustomerId    => 199,
-      clientCPUAffinity => "0xff",
+      clientCPUAffinity => "numactl -C 0-7",
       },
    );
 my $numWASInstances  = scalar(@WASServers); # all instances are collocated on the same machine
@@ -47,15 +47,11 @@ my $acmeairProperties= "$pathToWAS/usr/servers/acmeair/mongo.properties"; # Not 
 
 ### Mongodb configuration ###
 $ENV{ACMEAIR_PROPERTIES} = $acmeairProperties;
-my $useDockerForMongo = 1;
-my $db2Machine    = $useDockerForMongo ? "192.168.10.7" : "192.168.10.7";
-my $db2User       = $useDockerForMongo ? "mpirvu" : "mpirvu";
-my $db2RestoreCmd = $useDockerForMongo ? "ssh $db2User\@$db2Machine 'docker exec mongodb mongorestore --drop /AcmeAirDBBackup'" :
-                                         "ssh $db2User\@$db2Machine /home/mpirvu/AcmeAir/restoreAcmeAirDB.sh";
-my $db2Start      = $useDockerForMongo ? "ssh $db2User\@$db2Machine 'docker run --rm -d --net=host --name mongodb mongo-acmeair --nojournal'" :
-                                         "ssh $db2User\@$db2Machine /home/mpirvu/AcmeAir/startMonogoDB.sh"; #"ssh $db2User\@$db2Machine 'service mongod start'";
-my $db2Stop       = $useDockerForMongo ? "ssh $db2User\@$db2Machine 'docker stop mongodb'" :
-                                         "ssh $db2User\@$db2Machine /home/mpirvu/AcmeAir/stopMongoDB.sh";
+my $db2Machine    = "192.168.10.7";
+my $db2User       = "mpirvu";
+#my $db2RestoreCmd = "ssh $db2User\@$db2Machine 'docker exec mongodb mongorestore --drop /AcmeAirDBBackup'";
+my $db2Start      = "ssh $db2User\@$db2Machine 'docker run --rm -d --net=host --name mongodb mongo-acmeair --nojournal'";
+my $db2Stop       = "ssh $db2User\@$db2Machine 'docker stop mongodb'";
 $ENV{MONGO_HOST} = "$db2Machine";
 my $loadDatabaseCmd = "curl --ipv4 --silent --show-error http://$WASHost:8080/acmeair/rest/info/loader/load?numCustomers=10000";
 
@@ -64,7 +60,7 @@ my $clientMachine    = "192.168.11.8";
 my $clientUsername   = "root"; # only used when the client is remote
 my $numUsers         = 999;
 my $perfFileTemplate = "/tmp/daytrader.perf";
-my $jmeterClientCmd  = "cd /opt/IBM/JMeter-4.0; taskset AFFINITY_PLACEHOLDER bin/jmeter.sh -DusePureIDs=true -n -t AcmeAir-v5_context_acmair_withCancel.jmx -j /tmp/acmeair.stats.PLACEHOLDER_ID -JHOST=$WASHost -JPROTOCOL=https -JUSER=$numUsers -JRAMP=0";
+my $jmeterClientCmd  = "cd /opt/IBM/JMeter-4.0; AFFINITY_PLACEHOLDER bin/jmeter.sh -DusePureIDs=true -n -t AcmeAir-v5_context_acmair_withCancel.jmx -j /tmp/acmeair.stats.PLACEHOLDER_ID -JHOST=$WASHost -JPROTOCOL=https -JUSER=$numUsers -JRAMP=0";
 my $localClientCmd   = $jmeterClientCmd;
 my $remoteClientCmd  = "ssh $clientUsername\@$clientMachine \"$localClientCmd";
 my $clientCmd        = $clientMachine eq "localhost" ? $localClientCmd : $remoteClientCmd;
@@ -642,7 +638,7 @@ sub startWASInstance {
     my $port     = $WASServers[$WAS_ID]{port};
     my $cmd;
 
-    $cmd = "taskset ${affinity} ${wasStartupScript} ${extraArgs}";
+    $cmd = "${affinity} ${wasStartupScript} ${extraArgs}";
     print "+ Executing script $cmd with JDK=${javaHome} and opts=$jvmOpts\n" if $verbose >= 2;
 
     my $childPid = 0;
@@ -661,7 +657,7 @@ sub startWASInstance {
     }
     elsif (defined $childPid) {
         $ENV{JAVA_HOME} = $javaHome;
-        $ENV{JVM_ARGS} = $jvmOpts;
+        $ENV{JAVA_OPTS} = $jvmOpts;
         $ENV{TR_PrintCompTime} = 1;
         $ENV{TR_PrintCompStats} = 1;
         $ENV{TR_PrintJaasMsgStats} = 1;
@@ -694,9 +690,9 @@ sub runBenchmarkOnce {
 
     my $runThroughput = 0;
     #--- restore database ---
-    print "+ Restoring database\n" if $verbose >= 2;
-    my $answer = `$db2RestoreCmd`;
-    print "$answer\n" if $verbose >= 2;
+    #print "+ Restoring database\n" if $verbose >= 2;
+    #my $answer = `$db2RestoreCmd`;
+    #print "$answer\n" if $verbose >= 2;
 
     #--- possibly clear SCC ---
     if ($doOnlyColdRuns) {

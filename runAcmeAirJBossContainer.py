@@ -2,7 +2,7 @@ import logging # https://www.machinelearningplus.com/python/python-logging-guide
 import shlex, subprocess
 import time # for sleep
 import re # for regular expressions
-import numpy as np
+import math
 import sys # for number of arguments
 #import threading
 
@@ -40,13 +40,13 @@ jmeterUsername  = "mpirvu"
 jmeterAffinity  = "0-7"
 protocol        = "https" # http or https
 ################ Load CONFIG ###############
-numRepetitionsOneClient = 0
+numRepetitionsOneClient = 1
 numRepetitions50Clients = 2
 durationOfOneClient     = 30 # seconds
-durationOfOneRepetition = 240 # seconds
+durationOfOneRepetition = 40 # seconds
 numClients              = 50
 delayBetweenRepetitions = 10
-numMeasurementTrials    = 1 # Last N trials are used in computation of throughput
+numMeasurementTrials    = 2 # Last N trials are used in computation of throughput
 
 jvmOptions = [
     "",
@@ -57,6 +57,23 @@ jvmOptions = [
 appImages = [
     "jboss-acmeair-openj9:11",
 ]
+
+
+def nanmean(myList):
+    total = 0
+    numValidElems = 0
+    for i in range(len(myList)):
+        if not math.isnan(myList[i]):
+            total += myList[i]
+            numValidElems += 1
+    return total/numValidElems if numValidElems > 0 else math.nan
+
+def meanLastValues(myList, numLastValues):
+    assert numLastValues > 0
+    if numLastValues > len(myList):
+        numLastValues = len(myList)
+    return nanmean(myList[-numLastValues:])
+
 
 def stopContainersFromImage(host, username, imageName):
     # Find all running containers from image
@@ -380,23 +397,24 @@ def runPhase(duration, clients):
 
 
 def runBenchmarkOnce(image, javaOpts):
+    # Will apply load in small bursts
+    maxPulses = numRepetitionsOneClient + numRepetitions50Clients
+    thrResults = [math.nan for i in range(maxPulses)] # np.full((maxPulses), fill_value=np.nan, dtype=np.float)
+    rss, peakRss = math.nan, math.nan
+
     instanceID = startAppServerContainer(host=appServerHost, username=username, instanceName=instanceName, image=image, port=appServerPort, httpsport=appServerHttpsPort, cpus=cpuAffinity, mem=memLimit, jvmArgs=javaOpts, mongoHost=mongoHost, mongoPropertiesFile=mongoPropertiesFile)
     if instanceID is None:
-        return np.nan, np.nan
+        return thrResults, rss
 
     # We know the app started successfuly
     loadDatabase(appServerHost, username)
 
-    # Apply load in small bursts
-    maxIterations = numRepetitionsOneClient + numRepetitions50Clients
-    thrResults = np.full((maxIterations), fill_value=np.nan, dtype=np.float)
-    for iter in range(maxIterations):
-        thr = runPhase((durationOfOneRepetition if iter else durationOfOneClient), (numClients if iter else 1))
-        thrResults[iter] = thr
+    for pulse in range(maxPulses):
+        thrResults[pulse] = runPhase((durationOfOneRepetition if pulse else durationOfOneClient), (numClients if pulse else 1))
 
     # Collect RSS at end of run
     serverPID = getMainPIDFromContainer(host=appServerHost, username=username, instanceID=instanceID)
-    rss, peakRss = np.nan, np.nan
+
     if int(serverPID) > 0:
         rss, peakRss = getRss(host=appServerHost, username=username, pid=serverPID)
         logging.debug("Memory: RSS={rss} PeakRSS={peak}".format(rss=rss,peak=peakRss))
@@ -406,48 +424,57 @@ def runBenchmarkOnce(image, javaOpts):
 
     # If there were errors during the run, invalidate throughput results
     if not checkAppServerForErrors(instanceID, appServerHost, username):
-        thrResults = np.full((maxIterations), fill_value=np.nan, dtype=np.float) # Reset any throughput values
+        thrResults = [math.nan for i in range(maxPulses)] #np.full((maxPulses), fill_value=np.nan, dtype=np.float) # Reset any throughput values
 
     # stop container and read CompCPU
     rc = stopAppServerByID(appServerHost, username, instanceID)
     # container is already removed
 
-    # return throughput as an numpy array of throughput values for each burst and also the RSS
+    # return throughput as an array of throughput values for each burst and also the RSS
     return thrResults, rss, peakRss
 
 
 def runBenchmarkIteratively(numIter, image, javaOpts):
     # Initialize stats; 2D array of throughput results
     numPulses = numRepetitionsOneClient + numRepetitions50Clients
-    thrResults = np.full((numIter, numPulses), fill_value=np.nan, dtype=np.float)
-    rssResults = np.full((numIter), fill_value=np.nan, dtype=np.float)
+    thrResults = [] # List of lists
+    rssResults = [] # Just a list
 
     # clear SCC if needed (by destroying the SCC volume)
     if doColdRun:
         clearSCC(appServerHost, username)
 
     for iter in range(numIter):
-        thr, rss, peakRss = runBenchmarkOnce(image, javaOpts)
-        lastThr = np.nanmean(thr[-numMeasurementTrials:]) # average for last N pulses
-        print(f"Run {iter}: Thr={lastThr} RSS={rss} MB  PeakRSS={peakRss} MB")
-        thrResults[iter] = thr # copy all the pulses
-        rssResults[iter] = rss
+        thrList, rss, peakRss = runBenchmarkOnce(image, javaOpts)
+        lastThr = meanLastValues(thrList, numMeasurementTrials) # average for last N pulses
+        print(f"Run {iter}: Thr={lastThr:6.1f} RSS={rss} MB  PeakRSS={peakRss:6d} MB".format(lastThr=lastThr,rss=rss,peakRss=peakRss))
+        thrResults.append(thrList) # copy all the pulses
+        rssResults.append(rss)
 
     # print stats
     print(f"\nResults for image: {image} and opts: {javaOpts}")
-    thrAvgResults = np.full((numIter), fill_value=np.nan, dtype=np.float)
+    thrAvgResults = [math.nan for i in range(numIter)] # np.full((numIter), fill_value=np.nan, dtype=np.float)
     for iter in range(numIter):
         print("Run", iter, end="")
         for pulse in range(numPulses):
             print("\t{thr:7.1f}".format(thr=thrResults[iter][pulse]), end="")
-        thrAvgResults[iter] = np.nanmean(thrResults[iter][-numMeasurementTrials:])
-        print("\tAvg={thr:7.1f}  RSS={rss:8.0} MB".format(thr=thrAvgResults[iter], rss=rssResults[iter]))
+        thrAvgResults[iter] = meanLastValues(thrResults[iter], numMeasurementTrials) #np.nanmean(thrResults[iter][-numMeasurementTrials:])
+        print("\tAvg={thr:7.1f}  RSS={rss:7d} MB".format(thr=thrAvgResults[iter], rss=rssResults[iter]))
 
-    verticalAverages = np.nanmean(thrResults, axis=0)
+    verticalAverages = []  #verticalAverages = np.nanmean(thrResults, axis=0)
+    for pulse in range(numPulses):
+        total = 0
+        numValidEntries = 0
+        for iter in range(numIter):
+            if not math.isnan(thrResults[iter][pulse]):
+                total += thrResults[iter][pulse]
+                numValidEntries += 1
+        verticalAverages.append(total/numValidEntries if numValidEntries > 0 else math.nan)
+
     print("Avg:", end="")
     for pulse in range(numPulses):
         print("\t{thr:7.1f}".format(thr=verticalAverages[pulse]), end="")
-    print("\tAvg={avgThr:7.1f}  RSS={rss:7.1f} MB".format(avgThr=np.nanmean(thrAvgResults), rss=np.nanmean(rssResults)))
+    print("\tAvg={avgThr:7.1f}  RSS={rss:7.1f} MB".format(avgThr=nanmean(thrAvgResults), rss=nanmean(rssResults)))
     # TODO: print stderr and CI
 
 ############################ MAIN ##################################

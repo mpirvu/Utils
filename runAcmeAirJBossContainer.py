@@ -29,7 +29,7 @@ mountOpts       = f"--mount type=volume,src={SCCVolumeName},target={sccInstanceD
 mongoHost       = "192.168.1.7"
 mongoUser       = "mpirvu"
 mongoImage      = "mongo-acmeair"
-mongoPropertiesFile = '' # not used for JBoss version of AcmeAir
+mongoAffinity   = "--cpuset-cpus=16-47"
 loadDatabaseCmd = f"curl --ipv4 --silent --show-error http://{appServerHost}:{appServerPort}/acmeair/rest/info/loader/load?numCustomers=10000"
 ############### JMeter CONFIG ###############
 numUsers        = 999
@@ -103,16 +103,16 @@ def removeContainersFromImage(host, username, imageName):
 
 # start mongo on a remote machine
 def startMongo():
-    remoteCmd = f"docker run --rm -d --net=host --name mongodb {mongoImage} --nojournal"
+    remoteCmd = f"docker run --rm -d --net=host {mongoAffinity} --name mongodb {mongoImage} --nojournal --bind_ip=0.0.0.0"
     cmd = f"ssh {mongoUser}@{mongoHost} \"{remoteCmd}\""
     logging.info("Starting mongo: {cmd}".format(cmd=cmd))
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.STDOUT)
     time.sleep(2)
-    remoteCmd = "docker exec mongodb mongorestore --drop /AcmeAirDBBackup"
-    cmd = f"ssh {mongoUser}@{mongoHost} \"{remoteCmd}\""
-    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.STDOUT)
-    if logging.root.level <= logging.DEBUG:
-        print(output)
+    #remoteCmd = "docker exec mongodb mongorestore --drop /AcmeAirDBBackup"
+    #cmd = f"ssh {mongoUser}@{mongoHost} \"{remoteCmd}\""
+    #output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.STDOUT)
+    #if logging.root.level <= logging.DEBUG:
+    #    print(output)
 
 def stopMongo():
     # find the ID of the container, if any
@@ -197,8 +197,8 @@ def clearSCC(host, username):
     logging.info("Clearing SCC")
     remoteCmd = f"docker volume rm --force {SCCVolumeName}"
     cmd = f"ssh {username}@{host} \"{remoteCmd}\""
-    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
-    #lines = output.splitlines()
+    subprocess.run(shlex.split(cmd), universal_newlines=True)
+    # TODO: make sure volume does not exist
 
 
 '''
@@ -271,8 +271,8 @@ def stopAppServerByID(host, username, containerID):
     subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     return True
 
-def startAppServerContainer(host, username, instanceName, image, port, httpsport, cpus, mem, jvmArgs, mongoHost, mongoPropertiesFile):
-    remoteCmd = f"docker run -d --rm --cpuset-cpus={cpus} -m={mem} {mountOpts} -e JAVA_OPTS='{jvmArgs}' -v /tmp/vlogs:/tmp/vlogs -v {mongoPropertiesFile}:/config/mongo.properties -e MONGO_HOST={mongoHost} -e TR_PrintCompStats=1 -e TR_PrintCompTime=1  -p {port}:{port} -p {httpsport}:{httpsport} --name {instanceName} {image}"
+def startAppServerContainer(host, username, instanceName, image, port, httpsport, cpus, mem, jvmArgs, mongoHost):
+    remoteCmd = f"docker run -d --rm --cpuset-cpus={cpus} -m={mem} {mountOpts} -e JAVA_OPTS='{jvmArgs}' -e MONGO_HOST={mongoHost} -e TR_PrintCompStats=1 -e TR_PrintCompTime=1  -p {port}:{port} -p {httpsport}:{httpsport} --name {instanceName} {image}"
     cmd = f"ssh {username}@{host} \"{remoteCmd}\""
     logging.info("Starting AppServer instance {instanceName}: {cmd}".format(instanceName=instanceName,cmd=cmd))
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
@@ -294,7 +294,7 @@ def startAppServerContainer(host, username, instanceName, image, port, httpsport
 # Run jmeter remotely
 def applyLoad(duration, clients):
     port = appServerHttpsPort if protocol == "https" else appServerPort
-    remoteCmd = f"docker run -d --cpuset-cpus={jmeterAffinity} -e JTHREAD={clients} -e JDURATION={duration} -e JUSERBOTTOM=0 -e JUSER={numUsers} -e JPORT={port} -e JPROTOCOL={protocol} -e JHOST={appServerHost} -e JRAMP=0 --name {jmeterContainerName} {jmeterImage}"
+    remoteCmd = f"docker run -d --net=host --cpuset-cpus={jmeterAffinity} -e JTHREAD={clients} -e JDURATION={duration} -e JUSERBOTTOM=0 -e JUSER={numUsers} -e JPORT={port} -e JPROTOCOL={protocol} -e JHOST={appServerHost} -e JRAMP=0 --name {jmeterContainerName} {jmeterImage}"
     cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\""
     logging.info("Apply load: {cmd}".format(cmd=cmd))
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
@@ -402,7 +402,7 @@ def runBenchmarkOnce(image, javaOpts):
     thrResults = [math.nan for i in range(maxPulses)] # np.full((maxPulses), fill_value=np.nan, dtype=np.float)
     rss, peakRss = math.nan, math.nan
 
-    instanceID = startAppServerContainer(host=appServerHost, username=username, instanceName=instanceName, image=image, port=appServerPort, httpsport=appServerHttpsPort, cpus=cpuAffinity, mem=memLimit, jvmArgs=javaOpts, mongoHost=mongoHost, mongoPropertiesFile=mongoPropertiesFile)
+    instanceID = startAppServerContainer(host=appServerHost, username=username, instanceName=instanceName, image=image, port=appServerPort, httpsport=appServerHttpsPort, cpus=cpuAffinity, mem=memLimit, jvmArgs=javaOpts, mongoHost=mongoHost)
     if instanceID is None:
         return thrResults, rss
 
@@ -410,7 +410,13 @@ def runBenchmarkOnce(image, javaOpts):
     loadDatabase(appServerHost, username)
 
     for pulse in range(maxPulses):
-        thrResults[pulse] = runPhase((durationOfOneRepetition if pulse else durationOfOneClient), (numClients if pulse else 1))
+        if pulse >= numRepetitionsOneClient:
+            cli = numClients
+            duration = durationOfOneRepetition
+        else:
+            cli = 1
+            duration = durationOfOneClient
+        thrResults[pulse] = runPhase(duration, cli)
 
     # Collect RSS at end of run
     serverPID = getMainPIDFromContainer(host=appServerHost, username=username, instanceID=instanceID)
@@ -474,7 +480,7 @@ def runBenchmarkIteratively(numIter, image, javaOpts):
     print("Avg:", end="")
     for pulse in range(numPulses):
         print("\t{thr:7.1f}".format(thr=verticalAverages[pulse]), end="")
-    print("\tAvg={avgThr:7.1f}  RSS={rss:7.1f} MB".format(avgThr=nanmean(thrAvgResults), rss=nanmean(rssResults)))
+    print("\tAvg={avgThr:7.1f}  RSS={rss:7.0f} MB".format(avgThr=nanmean(thrAvgResults), rss=nanmean(rssResults)))
     # TODO: print stderr and CI
 
 ############################ MAIN ##################################

@@ -4,7 +4,6 @@
 #
 # Author: Marius Pirvu
 
-import operator # for sorting the dictionary
 import re # for regular expressions
 import sys # for accessing parameters and exit
 
@@ -37,7 +36,7 @@ def printHeaderStats():
     print("OptLvl\tSamples\tTOTAL(ms)\tMIN(usec)\tAVG(usec)\tMAX(ms)")
 
 def printBodySizeHeaderStats():
-    print("    \tSamples\tTOTAL(KB)\tMIN\tAVG\tMAX(KB)")
+    print("    \tSamples\tTOTAL(KB)\t     MIN\t     AVG\tMAX(KB)")
 
 def printStats(name, dataList):
     numSamples = len(dataList)
@@ -79,7 +78,7 @@ def parseVlog(vlog):
     #  (cold) Compiling java/lang/Double.longBitsToDouble(J)D  OrdinaryMethod j9m=0000000000097B18 t=20 compThreadID=0 memLimit=262144 KB freePhysicalMemory=75755 MB
     compStartPattern = re.compile('^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
     # + (cold) sun/reflect/Reflection.getCallerClass()Ljava/lang/Class; @ 00007FB21300003C-00007FB213000167 OrdinaryMethod - Q_SZ=1 Q_SZI=1 QW=2 j9m=000000000004D1D8 bcsz=2 JNI time=995us mem=[region=704 system=2048]KB compThreadID=0 CpuLoad=163%(10%avg) JvmCpu=0%
-    compEndPattern  = re.compile('^\+ \((.+)\) (\S+) \@ (0x)?([0-9A-F]+)-(0x)?([0-9A-F]+).+ Q_SZ=(\d+).+ time=(\d+)us')
+    compEndPattern  = re.compile('^\+ \((.+)\) (\S+) \@ (0x)?([0-9A-F]+)-(0x)?([0-9A-F]+)\s.+ Q_SZ=(\d+).+ time=(\d+)us')
     # ! (cold) java/nio/Buffer.<init>(IIII)V Q_SZ=274 Q_SZI=274 QW=275 j9m=00000000000B3970 time=99us compilationAotClassReloFailure memLimit=206574 KB freePhysicalMemory=205 MB mem=[region=64 system=2048]KB compThreadID=0
     compFailPattern = re.compile('^\! \(.+\) (\S+) .*time=(\d+)us (\S+) ')
     jvmCpuPattern = re.compile('^.+jvmCPU=(\d+)', re.IGNORECASE)
@@ -120,7 +119,9 @@ def parseVlog(vlog):
             else:
                 compTimesPerLevel[levelName] = [usec]
 
-            compBodySizes.append(methodEndAddr - methodStartAddr)
+            bodySize = methodEndAddr - methodStartAddr
+            assert bodySize > 0, "Method size must be positive"
+            compBodySizes.append(bodySize)
 
             if " GCR " in line:
                 numGCRBodies += 1
@@ -229,12 +230,19 @@ def parseVlog(vlog):
         print(reason, "=",   samples)
 
     print("\nMAXLINE:", maxCompLine)
+
+    print("Stats regarding compiled body sizes")
+    printBodySizeHeaderStats()
+    printStats("All", compBodySizes)
+    print("")
+
     print("Num recomps   =", numRecomp)
     print("GCR bodies    =", numGCRBodies) # not accurate for remote compilations
     print("GCR recomp    =", numGCR)
     print("Sync          =", numSync)
     print("DLT           =", numDLT)
-    print("Remote        =", numRemote, " Deserialized =", numDeserialized, " Local-Non-AOTLoad =", numLocalNonAOTLoad)
+    if numRemote > 0:
+        print("Remote        =", numRemote, " Deserialized =", numDeserialized, " Local-Non-AOTLoad =", numLocalNonAOTLoad)
     print("MAX Q_SZ      =", maxQSZ)
     print("MAX JvmCPU    =", maxJvmCPU, "%")
     print("MaxScratchMem =", maxScratchMem, "KB")
@@ -255,6 +263,9 @@ def parseVlog(vlog):
         print("WARNING: compilation was disabled at some point during JVM lifetime")
     if numInterpreted > 0:
         print(numInterpreted, "methods will continue as interpreted")
+
+
+
 ###################################################
 
 

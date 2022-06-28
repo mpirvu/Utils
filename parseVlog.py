@@ -11,6 +11,8 @@ import sys # for accessing parameters and exit
 compTimeThreshold = 10000000
 # The following boolean controls whether vlog parsing should stop after JVM detects end of start-up
 analyzeOnlyStartup = False
+# If set to True, the script will print all AOT loads that were not followed by a recompilation
+printAOTLoadsNotRecompiled = False
 
 
 # Dictionary that maps opt levels from vlog into shorter names
@@ -69,6 +71,7 @@ def parseVlog(vlog):
     failureHash = {}
     failedMethods = set() # set for tracking whether methods remain interpreted after a failure
     recompMethods = set() # set for computing the number of recompilations
+    aotLoadsNotRecompiled = set()
     numRecomp = 0
     crtTimeMs = 0 # current time in millis since the start of the JVM
     veryLongCompilations = []
@@ -78,7 +81,8 @@ def parseVlog(vlog):
     #  (cold) Compiling java/lang/Double.longBitsToDouble(J)D  OrdinaryMethod j9m=0000000000097B18 t=20 compThreadID=0 memLimit=262144 KB freePhysicalMemory=75755 MB
     compStartPattern = re.compile('^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
     # + (cold) sun/reflect/Reflection.getCallerClass()Ljava/lang/Class; @ 00007FB21300003C-00007FB213000167 OrdinaryMethod - Q_SZ=1 Q_SZI=1 QW=2 j9m=000000000004D1D8 bcsz=2 JNI time=995us mem=[region=704 system=2048]KB compThreadID=0 CpuLoad=163%(10%avg) JvmCpu=0%
-    compEndPattern  = re.compile('^\+ \((.+)\) (\S+) \@ (0x)?([0-9A-F]+)-(0x)?([0-9A-F]+)\s.+ Q_SZ=(\d+).+ time=(\d+)us')
+    # + (AOT load) java/lang/String.lengthInternal()I @ 00007FA6F8001140-00007FA6F8001168 Q_SZ=1 Q_SZI=1 QW=2 j9m=00000000000493F8 bcsz=37 time=51us compThreadID=0 queueTime=293us
+    compEndPattern  = re.compile('^\+ \(([\S -]+)\) (\S+) \@ (0x)?([0-9A-F]+)-(0x)?([0-9A-F]+)\s.*Q_SZ=(\d+).+ time=(\d+)us')
     # ! (cold) java/nio/Buffer.<init>(IIII)V Q_SZ=274 Q_SZI=274 QW=275 j9m=00000000000B3970 time=99us compilationAotClassReloFailure memLimit=206574 KB freePhysicalMemory=205 MB mem=[region=64 system=2048]KB compThreadID=0
     compFailPattern = re.compile('^\! \(.+\) (\S+) .*time=(\d+)us (\S+) ')
     jvmCpuPattern = re.compile('^.+jvmCPU=(\d+)', re.IGNORECASE)
@@ -141,6 +145,9 @@ def parseVlog(vlog):
             # If a method has compiled successfully after a failure, delete entry from the failure set
             failedMethods.discard(methodName) # no change if entry does not exist
 
+            if opt == "AOT load":
+                aotLoadsNotRecompiled.add(methodName)
+
             # Count recompilations
             if methodName not in recompMethods:
                 # First time compilation
@@ -148,7 +155,8 @@ def parseVlog(vlog):
             else: # Possible recomp
                 if opt != "AOT load": # AOT loads after AOT compilations are not counted as recompilations
                     numRecomp += 1
-
+                    if methodName in aotLoadsNotRecompiled:
+                        aotLoadsNotRecompiled.remove(methodName)
 
         else: # Check for compilation failures
             if line.startswith("!"):
@@ -263,7 +271,11 @@ def parseVlog(vlog):
         print("WARNING: compilation was disabled at some point during JVM lifetime")
     if numInterpreted > 0:
         print(numInterpreted, "methods will continue as interpreted")
-
+    if printAOTLoadsNotRecompiled:
+        print("\nAOT loads that were not recompiled:")
+        sortedMethods = sorted(aotLoadsNotRecompiled)
+        for method in sortedMethods:
+            print(method)
 
 
 ###################################################

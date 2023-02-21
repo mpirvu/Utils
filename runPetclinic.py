@@ -4,6 +4,7 @@ import time # for sleep
 import re # for regular expressions
 import math
 import sys # for number of arguments
+import os # for environment variables
 
 # Set level to level=logging.DEBUG, level=logging.INFO or level=WARNING reduced level of verbosity
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s :: %(levelname)s :: %(message)s',)
@@ -16,9 +17,10 @@ username        = "mpirvu" # for connecting remotely to the SUT
 instanceName    = "petclinic"
 appServerPort   = "8080"
 appServerHttpsPort = "8443"
-cpuAffinity     = "0"
+cpuAffinity     = "1"
 memLimit        = "1G"
-delayToStart    = 15 # seconds; waiting for the AppServer to start before checking for valid startup
+delayToStart    = 30 # seconds; waiting for the AppServer to start before checking for valid startup
+extraDockerOpts = "-v /tmp:/tmp" # extra options to pass to docker run
 ############### SCC configuration #####################
 useSCCVolume    = False  # set to true to have a SCC mounted in a volume; False for embedded SCC
 appServerDir    = "/work" # This is the directory in the container instance
@@ -43,16 +45,16 @@ numMeasurementTrials    = 1 # Last N trials are used in computation of throughpu
 thinkTime               = 0 # ms
 ############################# END CONFIG ####################################
 
+# ENV VARS to use for all runs
+TR_Options=""
+
 jvmOptions = [
-    #"-Xshareclasses:none",
-    "-Xjit:dontDowngradeToCold -Xshareclasses:none -XX:+UseJITServer -XX:JITServerAddress=192.168.1.9",
-    #"-Xmx1G",
-    #"-Xms1G -Xmx1G",
+    "-Xmx1G",
 ]
 
 appImages = [
     #"petclinic:11-0.29.0",
-    "petclinic:11"
+    "petclinic:11-0.35.0",
 ]
 
 
@@ -297,8 +299,23 @@ def stopAppServerByID(host, username, containerID):
     return True
 
 
+def removeAppServerByID(host, username, containerID):
+    remoteCmd = f"docker ps --all --quiet --filter id={containerID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    logging.debug("Removing container {containerID}".format(containerID=containerID))
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    if not lines:
+        logging.warning("AppServer instance {containerID} does not exist. Might have crashed.".format(containerID=containerID))
+        return False
+    remoteCmd = f"docker rm {containerID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    return True
+
+
 def startAppServerContainer(host, username, instanceName, image, port, httpsport, cpus, mem, jvmArgs):
-    remoteCmd = f"docker run -d --rm --cpuset-cpus={cpus} -m={mem} {mountOpts} -e _JAVA_OPTIONS='{jvmArgs}' -e TR_PrintCompStats=1 -e TR_PrintCompTime=1  -p {port}:{port} -p {httpsport}:{httpsport} --name {instanceName} {image}"
+    remoteCmd = f"docker run -d --cpuset-cpus={cpus} -m={mem} {mountOpts} {extraDockerOpts} -e TR_Options='{TR_Options}' -e _JAVA_OPTIONS='{jvmArgs}' -e TR_PrintCompStats=1 -e TR_PrintCompTime=1  -p {port}:{port} -p {httpsport}:{httpsport} --name {instanceName} {image}"
     dockerRunCmd = f"ssh {username}@{host} \"{remoteCmd}\""
     logging.info("Starting AppServer instance {instanceName} with cmd: {cmd}".format(instanceName=instanceName,cmd=dockerRunCmd))
     output = subprocess.check_output(shlex.split(dockerRunCmd), universal_newlines=True)
@@ -481,7 +498,13 @@ def runBenchmarkOnce(image, javaOpts):
 
     # stop container and read CompCPU
     rc = stopAppServerByID(appServerHost, username, instanceID)
-    # container is already removed
+    if rc:
+        rc = removeAppServerByID(appServerHost, username, instanceID)
+        if not rc:
+            logging.error("Cannot remove container {id}".format(id=instanceID))
+            sys.exit(-1)
+    else:
+        sys.exit(-1)
 
     # return throughput as an array of throughput values for each burst and also the RSS
     return thrResults, rss, peakRss

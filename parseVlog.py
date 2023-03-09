@@ -12,7 +12,9 @@ compTimeThreshold = 10000000
 # The following boolean controls whether vlog parsing should stop after JVM detects end of start-up
 analyzeOnlyStartup = False
 # If set to True, the script will print all AOT loads that were not followed by a recompilation
+# as well as all AOT loads that were followed by a recompilation
 printAOTLoadsNotRecompiled = False
+
 
 
 # Dictionary that maps opt levels from vlog into shorter names
@@ -72,6 +74,7 @@ def parseVlog(vlog):
     failedMethods = set() # set for tracking whether methods remain interpreted after a failure
     recompMethods = set() # set for computing the number of recompilations
     aotLoadsNotRecompiled = set()
+    aotLoadsRecompiled = set()
     numRecomp = 0
     crtTimeMs = 0 # current time in millis since the start of the JVM
     veryLongCompilations = []
@@ -156,7 +159,10 @@ def parseVlog(vlog):
                 if opt != "AOT load": # AOT loads after AOT compilations are not counted as recompilations
                     numRecomp += 1
                     if methodName in aotLoadsNotRecompiled:
+                        # Recompilation of an AOT load; remove from set
                         aotLoadsNotRecompiled.remove(methodName)
+                        # and add to set of recompiled AOT loads
+                        aotLoadsRecompiled.add(methodName)
 
         else: # Check for compilation failures
             if line.startswith("!"):
@@ -276,7 +282,10 @@ def parseVlog(vlog):
         sortedMethods = sorted(aotLoadsNotRecompiled)
         for method in sortedMethods:
             print(method)
-
+        print("\nAOT loads that were recompiled:")
+        sortedMethods = sorted(aotLoadsRecompiled)
+        for method in sortedMethods:
+            print(method)
 
 ###################################################
 

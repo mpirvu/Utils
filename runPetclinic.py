@@ -4,16 +4,17 @@ import time # for sleep
 import re # for regular expressions
 import math
 import sys # for number of arguments
+import queue
 import os # for environment variables
 
 # Set level to level=logging.DEBUG, level=logging.INFO or level=WARNING reduced level of verbosity
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s :: %(levelname)s :: %(message)s',)
-
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s :: %(levelname)s :: %(message)s',)
+docker = 'podman'
 
 ################### Benchmark configuration #################
 doColdRun       = False  # when True we clear the SCC before the first run. Set it to False for embedded SCC
-appServerHost   = "192.168.1.9"
-username        = "mpirvu" # for connecting remotely to the SUT
+appServerHost   = "9.46.116.36" # Cannot use localhost because JMeter runs in docker
+username        = "" # for connecting remotely to the SUT. If this is empty we assume that local machine is going to be used
 instanceName    = "petclinic"
 appServerPort   = "8080"
 appServerHttpsPort = "8443"
@@ -21,6 +22,7 @@ cpuAffinity     = "1"
 memLimit        = "1G"
 delayToStart    = 30 # seconds; waiting for the AppServer to start before checking for valid startup
 extraDockerOpts = "-v /tmp:/tmp" # extra options to pass to docker run
+netOpts         = "--network=slirp4netns" if docker == "podman" else "" # for podman we need to use slirp4netns if running as root.
 ############### SCC configuration #####################
 useSCCVolume    = False  # set to true to have a SCC mounted in a volume; False for embedded SCC
 appServerDir    = "/work" # This is the directory in the container instance
@@ -29,9 +31,9 @@ SCCVolumeName   = "scc_volume"
 mountOpts       = f"--mount type=volume,src={SCCVolumeName},target={sccInstanceDir}" if useSCCVolume  else ""
 ############### JMeter CONFIG ###############
 jmeterContainerName = "jmeter"
-jmeterImage     = "jmeterpetclinic:3.3"
-jmeterMachine   = "192.168.1.9"
-jmeterUsername  = "mpirvu"
+jmeterImage     = "localhost/jmeterpetclinic:3.3"
+jmeterMachine   = "localhost"
+jmeterUsername  = ""  # If this is empty, we assume that JMeter runs on the local machine
 jmeterAffinity  = "2-3"
 protocol        = "http" # http or https
 ################ Load CONFIG ###############
@@ -54,7 +56,7 @@ jvmOptions = [
 
 appImages = [
     #"petclinic:11-0.29.0",
-    "petclinic:11-0.35.0",
+    "localhost/petclinic:J17-0.38.0",
 ]
 
 
@@ -152,13 +154,13 @@ def meanLastValues(myList, numLastValues):
 
 def stopContainersFromImage(host, username, imageName):
     # Find all running containers from image
-    remoteCmd = f"docker ps --quiet --filter ancestor={imageName}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} ps --quiet --filter ancestor={imageName}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     lines = output.splitlines()
     for containerID in lines:
-        remoteCmd = f"docker stop {containerID}"
-        cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+        remoteCmd = f"{docker} stop {containerID}"
+        cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
         print("Stopping container: ", cmd)
         output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
 
@@ -166,48 +168,74 @@ def removeContainersFromImage(host, username, imageName):
     # First stop running containers
     stopContainersFromImage(host, username, imageName)
     # Now remove stopped containes
-    remoteCmd = f"docker ps -a --quiet --filter ancestor={imageName}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} ps -a --quiet --filter ancestor={imageName}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     lines = output.splitlines()
     for containerID in lines:
-        remoteCmd = f"docker rm {containerID}"
-        cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+        remoteCmd = f"{docker} rm {containerID}"
+        cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
         print("Removing container: ", cmd)
         output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
 
-# This works based on knowledge that there is a script which calls the java process
-# so, we use docker inspect to find the PID of the script and then we find the child of this PID
 def getMainPIDFromContainer(host, username, instanceID):
-    remoteCmd = "docker inspect --format='{{.State.Pid}}' " + instanceID
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} inspect " + "--format='{{.State.Pid}}' " + instanceID
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     try:
         output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
         lines = output.splitlines()
-        ppid = lines[0]
-        remoteCmd = "ps -eo ppid,pid,cmd --no-headers"
-        cmd = f"ssh {username}@{host} \"{remoteCmd}\""
-        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
-        lines = output.splitlines()
-        pattern = re.compile("(\d+)\s+(\d+)\s+(\S+)")
-        for line in lines: # There should be two lines (maybe header too)
-            m = pattern.match(line)
-            if m:
-                if ppid == m.group(1): # matching parent
-                    return m.group(2)
+        return lines[0]
     except:
         return 0
     return 0
 
-# This function can be used when the java process is the main process in container
+# Given a container ID, find all the Java processes running in it
+# If there is only one Java process, return its PID
 def getJavaPIDFromContainer(host, username, instanceID):
-    remoteCmd = "docker inspect --format='{{.State.Pid}}' " + instanceID
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    mainPID = getMainPIDFromContainer(host, username, instanceID)
+    if mainPID == 0:
+        return 0 # Error
+    logging.debug("Main PID from container is {mainPID}".format(mainPID=mainPID))
+    # Find all PIDs running on host
+    remoteCmd = "ps -eo ppid,pid,cmd --no-headers"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     lines = output.splitlines()
-    pid = lines[0]
-    logging.info("Found java pid: {pid}".format(pid=pid))
-    return pid
+    pattern = re.compile("^\s*(\d+)\s+(\d+)\s+(\S+)")
+    # Construct a dictionary with key=PPID and value a list of PIDs (for its children)
+    ppid2pid = {}
+    pid2cmd = {}
+    for line in lines:
+        m = pattern.match(line)
+        if m:
+            ppid = m.group(1)
+            pid = m.group(2)
+            cmd = m.group(3)
+            if ppid in ppid2pid:
+                ppid2pid[ppid].append(pid)
+            else:
+                ppid2pid[ppid] = [pid]
+            pid2cmd[pid] = cmd
+    # Do a breadth-first search to find all Java processes. Use a queue.
+    javaPIDs = []
+    pidQueue = queue.Queue()
+    pidQueue.put(mainPID)
+    while not pidQueue.empty():
+        pid = pidQueue.get()
+        # If this PID is a Java process, add it to the list
+        if "java" in pid2cmd[pid]:
+            javaPIDs.append(pid)
+        if pid in ppid2pid: # If my PID has children
+            for childPID in ppid2pid[pid]:
+                pidQueue.put(childPID)
+    if len(javaPIDs) == 0:
+        logging.error("Could not find any Java process in container {instanceID}".format(instanceID=instanceID))
+        return 0
+    if len(javaPIDs) > 1:
+        logging.error("Found more than one Java process in container {instanceID}".format(instanceID=instanceID))
+        return 0
+    return javaPIDs[0]
+
 
 # Given a PID, return RSS and peakRSS for the process
 def getRss(host, username, pid):
@@ -215,7 +243,7 @@ def getRss(host, username, pid):
     # get pseudo file  /proc/<pid>/status
     filename = "/proc/" + pid + "/status"
     remoteCmd = f"cat {filename}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     try:
         s = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
         #lines = s.splitlines()
@@ -239,10 +267,35 @@ def getRss(host, username, pid):
     return rss, peakRss
 
 
+def getCompCPUFromContainer(host, username, instanceID):
+    logging.debug("Computing CompCPU for AppServer instance {instanceID}".format(instanceID=instanceID))
+    # Check that the indicated container still exists
+    remoteCmd = f"{docker} ps -a --quiet --filter id={instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    if not lines:
+        logging.warning("Liberty instance {instanceID} does not exist.".format(instanceID=instanceID))
+        return math.nan
+
+    threadTime = 0.0
+    remoteCmd = f"{docker} logs --tail=50 {instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.STDOUT) # I need to capture stderr as well
+    liblines = output.splitlines()
+    compTimePattern = re.compile("^Time spent in compilation thread =(\d+) ms")
+    for line in liblines:
+        print(line)
+        m = compTimePattern.match(line)
+        if m:
+            threadTime += float(m.group(1))
+    return threadTime if threadTime > 0 else math.nan
+
+
 def clearSCC(host, username):
     logging.info("Clearing SCC")
-    remoteCmd = f"docker volume rm --force {SCCVolumeName}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} volume rm --force {SCCVolumeName}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     subprocess.run(shlex.split(cmd), universal_newlines=True)
     # TODO: make sure volume does not exist
 
@@ -250,16 +303,16 @@ def clearSCC(host, username):
 return True if AppServer inside given container ID has started successfully; False otherwise
 '''
 def verifyAppServerInContainerIDStarted(instanceID, host, username):
-    remoteCmd = f"docker ps --quiet --filter id={instanceID}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} ps --quiet --filter id={instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     lines = output.splitlines()
     if not lines:
         logging.warning("AppServer container {instanceID} is not running").format(instanceID=instanceID)
         return False
 
-    remoteCmd = f"docker logs --tail=100 {instanceID}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} logs --tail=100 {instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     errPattern = re.compile('^.+ ERROR ')
 
     # 2023-01-21 23:41:45.449  INFO 1 --- [           main] o.s.s.petclinic.PetClinicApplication     : Started PetClinicApplication in 3.564 seconds (JVM running for 3.913)
@@ -285,38 +338,38 @@ def verifyAppServerInContainerIDStarted(instanceID, host, username):
 
 
 def stopAppServerByID(host, username, containerID):
-    remoteCmd = f"docker ps --quiet --filter id={containerID}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} ps --quiet --filter id={containerID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     logging.debug("Stopping container {containerID}".format(containerID=containerID))
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     lines = output.splitlines()
     if not lines:
         logging.warning("AppServer instance {containerID} does not exist. Might have crashed".format(containerID=containerID))
         return False
-    remoteCmd = f"docker stop {containerID}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} stop {containerID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     return True
 
 
 def removeAppServerByID(host, username, containerID):
-    remoteCmd = f"docker ps --all --quiet --filter id={containerID}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} ps --all --quiet --filter id={containerID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     logging.debug("Removing container {containerID}".format(containerID=containerID))
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     lines = output.splitlines()
     if not lines:
         logging.warning("AppServer instance {containerID} does not exist. Might have crashed.".format(containerID=containerID))
         return False
-    remoteCmd = f"docker rm {containerID}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} rm {containerID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     return True
 
 
 def startAppServerContainer(host, username, instanceName, image, port, httpsport, cpus, mem, jvmArgs):
-    remoteCmd = f"docker run -d --cpuset-cpus={cpus} -m={mem} {mountOpts} {extraDockerOpts} -e TR_Options='{TR_Options}' -e _JAVA_OPTIONS='{jvmArgs}' -e TR_PrintCompStats=1 -e TR_PrintCompTime=1  -p {port}:{port} -p {httpsport}:{httpsport} --name {instanceName} {image}"
-    dockerRunCmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} run -d --cpuset-cpus={cpus} -m={mem} {mountOpts} {extraDockerOpts} {netOpts} -e TR_Options='{TR_Options}' -e _JAVA_OPTIONS='{jvmArgs}' -e TR_PrintCompTime=1  -p {port}:{port} -p {httpsport}:{httpsport} --name {instanceName} {image}"
+    dockerRunCmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     logging.info("Starting AppServer instance {instanceName} with cmd: {cmd}".format(instanceName=instanceName,cmd=dockerRunCmd))
     output = subprocess.check_output(shlex.split(dockerRunCmd), universal_newlines=True)
     lines = output.splitlines()
@@ -337,24 +390,24 @@ def startAppServerContainer(host, username, instanceName, image, port, httpsport
 # Run jmeter remotely
 def applyLoad(duration, clients):
     port = appServerHttpsPort if protocol == "https" else appServerPort
-    remoteCmd = f"docker run -d --net=host --cpuset-cpus={jmeterAffinity} -e JTHREADS={clients} -e JDURATION={duration} -e JPORT={port} -e JHOST={appServerHost} -e JTHINKTIME={thinkTime} --name {jmeterContainerName} {jmeterImage}"
-    cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\""
+    remoteCmd = f"{docker} run -d --net=host --cpuset-cpus={jmeterAffinity} -e JTHREADS={clients} -e JDURATION={duration} -e JPORT={port} -e JHOST={appServerHost} -e JTHINKTIME={thinkTime} --name {jmeterContainerName} {jmeterImage}"
+    cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\"" if username else remoteCmd
     logging.info("Apply load: {cmd}".format(cmd=cmd))
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     logging.debug(f"{output}")
 
 
 def stopJMeter():
-    remoteCmd = f"docker rm {jmeterContainerName}"
-    cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\""
+    remoteCmd = f"{docker} rm {jmeterContainerName}"
+    cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\"" if username else remoteCmd
     logging.debug("Removing jmeter: {cmd}".format(cmd=cmd))
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
 
 
 def getJMeterSummary():
     logging.debug("Getting throughput info...")
-    remoteCmd = f"docker logs --tail=100 {jmeterContainerName}"
-    cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\""
+    remoteCmd = f"{docker} logs --tail=100 {jmeterContainerName}"
+    cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\"" if username else remoteCmd
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.DEVNULL)
     lines = output.splitlines()
 
@@ -427,8 +480,8 @@ def runPhase(duration, clients):
     applyLoad(duration, clients)
 
     # Wait for load to finish
-    remoteCmd = f"docker wait {jmeterContainerName}"
-    cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\""
+    remoteCmd = f"{docker} wait {jmeterContainerName}"
+    cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\"" if username else remoteCmd
     logging.debug("Wait for {jmeter} to end: {cmd}".format(jmeter=jmeterContainerName, cmd=cmd))
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
 
@@ -443,16 +496,16 @@ def runPhase(duration, clients):
 
 
 def checkAppServerForErrors(instanceID, host, username):
-    remoteCmd = f"docker ps --quiet --filter id={instanceID}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} ps --quiet --filter id={instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     lines = output.splitlines()
     if not lines:
         logging.warning("AppServer container {instanceID} is not running").format(instanceID=instanceID)
         return False
 
-    remoteCmd = f"docker logs --tail=200 {instanceID}"
-    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    remoteCmd = f"{docker} logs --tail=200 {instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
     errPattern = re.compile('^.+ERROR')
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.STDOUT)
     liblines = output.splitlines()
@@ -496,18 +549,20 @@ def runBenchmarkOnce(image, javaOpts):
     if not checkAppServerForErrors(instanceID, appServerHost, username):
         thrResults = [math.nan for i in range(maxPulses)] #np.full((maxPulses), fill_value=np.nan, dtype=np.float) # Reset any throughput values
 
-    # stop container and read CompCPU
-    rc = stopAppServerByID(appServerHost, username, instanceID)
-    if rc:
-        rc = removeAppServerByID(appServerHost, username, instanceID)
-        if not rc:
+    # stop container
+    success = stopAppServerByID(appServerHost, username, instanceID)
+    if success:
+        # read CompCPU
+        cpu = getCompCPUFromContainer(appServerHost, username, instanceID)
+        success = removeAppServerByID(appServerHost, username, instanceID)
+        if not success:
             logging.error("Cannot remove container {id}".format(id=instanceID))
             sys.exit(-1)
     else:
         sys.exit(-1)
 
     # return throughput as an array of throughput values for each burst and also the RSS
-    return thrResults, rss, peakRss
+    return thrResults, rss, peakRss, float(cpu/1000.0)
 
 
 def runBenchmarkIteratively(numIter, image, javaOpts):
@@ -515,17 +570,19 @@ def runBenchmarkIteratively(numIter, image, javaOpts):
     numPulses = numRepetitionsOneClient + numRepetitions50Clients
     thrResults = [] # List of lists
     rssResults = [] # Just a list
+    cpuResults = []
 
     # clear SCC if needed (by destroying the SCC volume)
     if doColdRun:
         clearSCC(appServerHost, username)
 
     for iter in range(numIter):
-        thrList, rss, peakRss = runBenchmarkOnce(image, javaOpts)
+        thrList, rss, peakRss, cpu = runBenchmarkOnce(image, javaOpts)
         lastThr = meanLastValues(thrList, numMeasurementTrials) # average for last N pulses
-        print(f"Run {iter}: Thr={lastThr:6.1f} RSS={rss} MB  PeakRSS={peakRss:6d} MB".format(lastThr=lastThr,rss=rss,peakRss=peakRss))
+        print(f"Run {iter}: Thr={lastThr:6.1f} RSS={rss:6.1f} MB  PeakRSS={peakRss:6.1f} MB  CPU={cpu:4.1f} sec".format(lastThr=lastThr,rss=rss,peakRss=peakRss,cpu=cpu))
         thrResults.append(thrList) # copy all the pulses
         rssResults.append(rss)
+        cpuResults.append(cpu)
 
     # print stats
     print(f"\nResults for image: {image} and opts: {javaOpts}")
@@ -535,7 +592,7 @@ def runBenchmarkIteratively(numIter, image, javaOpts):
         for pulse in range(numPulses):
             print("\t{thr:7.1f}".format(thr=thrResults[iter][pulse]), end="")
         thrAvgResults[iter] = meanLastValues(thrResults[iter], numMeasurementTrials) #np.nanmean(thrResults[iter][-numMeasurementTrials:])
-        print("\tAvg={thr:7.1f}  RSS={rss:7d} MB".format(thr=thrAvgResults[iter], rss=rssResults[iter]))
+        print("\tAvg={thr:7.1f}  RSS={rss:7d} MB  CompCPU={cpu:5.1f} sec".format(thr=thrAvgResults[iter], rss=rssResults[iter], cpu=cpuResults[iter]))
 
     verticalAverages = []  #verticalAverages = np.nanmean(thrResults, axis=0)
     for pulse in range(numPulses):
@@ -550,7 +607,7 @@ def runBenchmarkIteratively(numIter, image, javaOpts):
     print("Avg:", end="")
     for pulse in range(numPulses):
         print("\t{thr:7.1f}".format(thr=verticalAverages[pulse]), end="")
-    print("\tAvg={avgThr:7.1f}  RSS={rss:7.0f} MB".format(avgThr=nanmean(thrAvgResults), rss=nanmean(rssResults)))
+    print("\tAvg={avgThr:7.1f}  RSS={rss:7.0f} MB  CompCPU={cpu:5.1f}".format(avgThr=nanmean(thrAvgResults), rss=nanmean(rssResults), cpu=nanmean(cpuResults)))
     # Throughput stats
     avg, stdDev, min, max, ci95 = computeStats(thrAvgResults)
     print("Throughput stats: Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:7.1f} CI95={ci95:7.1f}%".

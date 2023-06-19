@@ -76,24 +76,14 @@ maxUsers                = 199 # Maximum number of simulated AcmeAir users
 
 
 # ENV VARS to use for all runs
-#TR_Options=""
-TR_Options="{com/ibm/ws/jaxrs20/injection/InjectionRuntimeContextHelper.findBeanCustomizer(Ljava/lang/Class;Lorg/apache/cxf/Bus;)Lcom/ibm/ws/jaxrs20/api/JaxRsFactoryBeanCustomizer;}(traceFull,traceInlining,log=/tmp/log.disableHCR.txt)"
+TR_Options=""
 
 
 jvmOptions = [
-        #"-Xjit:disableNextGenHCR -Xshareclasses:none -XX:+EnableHCR -Xmx256m",
-        #"-XX:+EnableHCR -Xshareclasses:none -Xjit:dontDowngradeToCold,disableSelectiveNoServer,verbose={compilePerformance},verbose={inlining},vlog=/tmp/vlog.default.txt -Xmx256m",
-        "-XX:+EnableHCR -Xshareclasses:none -Xjit:disableNextGenHCR,dontDowngradeToCold,disableSelectiveNoServer -Xmx256m",
-        #"-XX:+EnableHCR -Xshareclasses:none -Xjit:dontDowngradeToCold,disableSelectiveNoServer -Xmx256m ",
-        #"-XX:-EnableHCR -Xshareclasses:none -Xjit:dontDowngradeToCold,disableSelectiveNoServer -Xmx256m "
-        #"-XX:-TieredCompilation -Xmx256m"
+        "-Xmx256m"
 ]
 
 jdks = [
-    #"/home/mpirvu/sdks/OpenJDK8U-jre_x64_linux_hotspot_8u372b07",
-    #"/home/mpirvu/sdks/pxa6480sr4fp1-20170215_01",
-    #"/home/mpirvu/sdks/pxa6480sr9-20230606_01",
-    #"/home/mpirvu/sdks/OpenJ9-JDK17-x86-64_linux-20230526-191133",
     "/home/mpirvu/FullJava17/openj9-openjdk-jdk17/build/linux-x86_64-server-release/images/jdk",
 ]
 
@@ -274,7 +264,7 @@ def collectJavacore(javaPID):
 
 def collectSmaps(javaPID):
     # Get smaps file
-    cmd = f"cp /proc/{javaPID}/smaps /tmp/smaps.{javaPID}"
+    cmd = f"cp /proc/{javaPID}/smaps {dirForMemAnalysisFiles}/smaps.{javaPID}"
     try:
         subprocess.run(shlex.split(cmd), universal_newlines=True)
     except:
@@ -334,6 +324,7 @@ def startAppServer(jdk, jvmArgs):
     myEnv["JAVA_HOME"] = jdk
     myEnv["JVM_ARGS"] = jvmArgs
     myEnv["TR_PrintCompTime"] = "1"
+    #myEnv["TR_PrintCompStats"] = "1"
     myEnv["TR_Options"] = TR_Options
     # Fork a process and run in background
     childProcess = subprocess.Popen(shlex.split(appServerStartCmd), env=myEnv, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -400,6 +391,7 @@ def getCompCPU(childProcess):
     threadTime = 0.0
     compTimePattern = re.compile("^Time spent in compilation thread =(\d+) ms")
     for line in lines:
+        #print(line)
         m = compTimePattern.match(line)
         if m:
             threadTime += float(m.group(1))
@@ -615,6 +607,18 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     # Throughput stats
     avg, stdDev, min, max, ci95 = computeStats(thrAvgResults)
     print("Throughput stats: Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:7.1f} CI95={ci95:7.1f}%".
+                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=max/min, ci95=ci95))
+    # Footprint stats
+    avg, stdDev, min, max, ci95 = computeStats(rssResults)
+    print("Footprint stats:  Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:7.1f} CI95={ci95:7.1f}%".
+                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=max/min, ci95=ci95))
+    # CompCPU stats
+    avg, stdDev, min, max, ci95 = computeStats(cpuResults)
+    print("Comp CPU stats:   Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:7.1f} CI95={ci95:7.1f}%".
+                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=max/min, ci95=ci95))
+    # Start-up stats
+    avg, stdDev, min, max, ci95 = computeStats(startupResults)
+    print("StartupTime stats:Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:7.1f} CI95={ci95:7.1f}%".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=max/min, ci95=ci95))
 
 def cleanup():

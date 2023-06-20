@@ -31,9 +31,16 @@ logFile            = f"{applicationLocation}/logs/messages.log"
 appServerStartCmd  = f"{AppServerAffinity} {AppServerLocation}/bin/server run {applicationName}"
 appServerStopCmd   = f"{AppServerLocation}/bin/server stop {applicationName}"
 startupWaitTime    = 30 # seconds to wait before checking to see if AppServer is up
+
 memAnalysis = False # Collect javacores and smaps for memory analysis
 dirForMemAnalysisFiles = "/tmp"
 extraArgsForMemAnalysis = f" -Dcom.ibm.dbgmalloc=true -Xdump:none -Xdump:system:events=user,file={dirForMemAnalysisFiles}/core.%pid.%seq.dmp -Xdump:java:events=user,file={dirForMemAnalysisFiles}/javacore.%pid.%seq.txt"
+# For collection of profiles, -Xjit:perfTool may need to be added to the OpenJ9 command line
+# Also you must ensure that "perf" is installed and the user has the rights to collect such a profile   sudo sh -c " echo 0 >  /proc/sys/kernel/perf_event_paranoid"
+collectPerfProfile = False # Collect perf profile for performance analysis;
+perfProfileOutput = "/tmp/perf.data"
+perfCmd= f"perf record -e cycles -c 200000 -o {perfProfileOutput}"
+perfDuration = 300 # seconds
 
 
 ############### SCC configuration ###########################
@@ -274,6 +281,63 @@ def collectJavacoreAndSmaps(javaPID):
     collectJavacore(javaPID)
     collectSmaps(javaPID)
 
+
+"""
+Find the main compilation thread ID of an OpenJ9 JVM process
+The JVM can have multiple compilation threads; in this case we will
+return the TID for the compilation thread that used most of the CPU
+"""
+def findMainCompThreadID(javaPID):
+    logging.debug("Determine the threads of PID={pid}".format(pid=javaPID))
+    # Exec an external command to get the threads of the Java process
+    cmd = f"ps -T -p {javaPID}"
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    """
+       PID    SPID TTY          TIME CMD
+    157603  157603 pts/0    00:00:00 java
+    157603  157624 pts/0    00:00:01 main
+    157603  157625 pts/0    00:00:00 Signal Reporter
+    157603  157626 pts/0    00:00:12 JIT Compilation
+    157603  157627 pts/0    00:00:00 JIT Compilation
+    157603  157635 pts/0    00:00:00 JIT IProfiler
+    """
+    lines = output.splitlines()
+    # Verify that the header is as expected
+    psHeaderPattern = re.compile('^\s*PID\s+SPID\s+TTY\s+TIME\s+CMD\s*$')
+    if not psHeaderPattern.match(lines[0]):
+        raise Exception("Unexpected output from ps command when determining thread IDs: {header}".format(header=lines[0]))
+    psOutputPattern = re.compile('^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\d\d):(\d\d):(\d\d)\s+JIT Compilation')
+    compThreadId = None
+    compCPU = 0
+    # Skip the first line and search for the JIT Compilation TID with most CPU consumed
+    for line in lines[1:]:
+        m = psOutputPattern.match(line)
+        if m:
+            cpu = int(m.group(4)) * 3600 + int(m.group(5)) * 60 + int(m.group(6))
+            if cpu > compCPU:
+                compCPU = cpu
+                compThreadId = m.group(2)
+    return compThreadId
+
+def collectJITPerfProfile(javaPID):
+    compThreadTID = findMainCompThreadID(javaPID)
+    if not compThreadTID:
+        logging.error("Cannot find main compilation thread ID for PID={pid}".format(pid=javaPID))
+        return
+    # Get the JIT perf profile in the background
+    perfProcess = None
+    cmd = f"{perfCmd} --tid {compThreadTID} -- sleep {perfDuration}"
+    try:
+        # Fork a process and run in background
+        perfProcess = subprocess.Popen(shlex.split(cmd), universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # This process will run for the specified amount of time (perfDuration) and then end
+    except subprocess.CalledProcessError as e:
+        logging.error("CalledProcessError calling perf record: {e}".format(e=e))
+        #output = str(e)
+    except subprocess.SubprocessError as e:
+        logging.error("SubprocessError calling perf record: {e}".format(e=e))
+    logging.info("Collecting JIT perf profile in the background for TID={tid} with cmd={cmd}".format(tid=compThreadTID, cmd=cmd))
+    return perfProcess
 
 
 def clearSCC(jdk, sccDestroyParams):
@@ -519,6 +583,12 @@ def runBenchmarkOnce(jdk, jvmArgs, doMemAnalysis):
 
     # Compute AppServer start-up time
     startupTime = getStartupTime(startTimeMs)
+
+    if collectPerfProfile:
+        if childProcess.poll() is None: # Still running:
+            collectJITPerfProfile(childProcess.pid)
+        else:
+            logging.error("Failed to start perf profiling because Java process has terminated")
 
     peakThroughput = 0
     for pulse in range(maxPulses):

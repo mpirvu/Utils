@@ -94,6 +94,13 @@ jdks = [
     "/home/mpirvu/FullJava17/openj9-openjdk-jdk17/build/linux-x86_64-server-release/images/jdk",
 ]
 
+def count_not_nan(myList):
+    total = 0
+    for i in range(len(myList)):
+        if not math.isnan(myList[i]):
+            total += 1
+    return total
+
 def nanmean(myList):
     total = 0
     numValidElems = 0
@@ -176,7 +183,8 @@ def computeStats(myList):
     min = nanmin(myList)
     max = nanmax(myList)
     ci95 = meanConfidenceInterval95(myList)
-    return avg, stdDev, min, max, ci95
+    numValues = count_not_nan(myList)
+    return avg, stdDev, min, max, ci95, numValues
 
 
 def meanLastValues(myList, numLastValues):
@@ -675,21 +683,21 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     print("\tThr={avgThr:7.1f}  RSS={rss:7.0f} MB  CompCPU={cpu:5.1f} sec  Startup={startup:5.0f} ms".
           format(avgThr=nanmean(thrAvgResults), rss=nanmean(rssResults), cpu=nanmean(cpuResults), startup=nanmean(startupResults)))
     # Throughput stats
-    avg, stdDev, min, max, ci95 = computeStats(thrAvgResults)
-    print("Throughput stats: Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:7.1f} CI95={ci95:7.1f}%".
-                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=max/min, ci95=ci95))
+    avg, stdDev, min, max, ci95, numSamples = computeStats(thrAvgResults)
+    print("Throughput stats: Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
+                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
     # Footprint stats
-    avg, stdDev, min, max, ci95 = computeStats(rssResults)
-    print("Footprint stats:  Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:7.1f} CI95={ci95:7.1f}%".
-                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=max/min, ci95=ci95))
+    avg, stdDev, min, max, ci95, numSamples = computeStats(rssResults)
+    print("Footprint stats:  Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
+                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
     # CompCPU stats
-    avg, stdDev, min, max, ci95 = computeStats(cpuResults)
-    print("Comp CPU stats:   Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:7.1f} CI95={ci95:7.1f}%".
-                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=max/min, ci95=ci95))
+    avg, stdDev, min, max, ci95, numSamples = computeStats(cpuResults)
+    print("Comp CPU stats:   Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
+                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
     # Start-up stats
-    avg, stdDev, min, max, ci95 = computeStats(startupResults)
-    print("StartupTime stats:Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:7.1f} CI95={ci95:7.1f}%".
-                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=max/min, ci95=ci95))
+    avg, stdDev, min, max, ci95, numSamples = computeStats(startupResults)
+    print("StartupTime stats:Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
+                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
 
 def cleanup():
     stopContainersFromImage(dbMachine, dbUsername, dbImage)

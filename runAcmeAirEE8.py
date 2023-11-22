@@ -21,6 +21,7 @@ netOpts = "--network=slirp4netns" if docker == "podman" else "" # for podman we 
 
 ################### Benchmark configuration #################
 doColdRun          = False # when True we clear the SCC before the first run. Set it to False for embedded SCC
+doOnlyColdRuns     = False # when True we run only the cold runs (doColdRun flag is ignored)
 AppServerHost      = "localhost" # the host where the app server is running from the point of view of the JMeter machine
 AppServerPort      = 9080
 AppServerLocation  = "/opt/IBM/OL-23.0.0.3/liberty"
@@ -639,7 +640,7 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     startupResults = []
 
     # clear SCC if needed (by destroying the SCC volume)
-    if doColdRun:
+    if doColdRun or doOnlyColdRuns:
         clearSCC(jdk, sccDestroyParams)
 
     for iter in range(numIter):
@@ -656,8 +657,12 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
         cpuResults.append(cpu)
         startupResults.append(startupTime)
 
+    startIter = 0 if (doOnlyColdRuns or not doColdRun) else 1
+
     # print stats
     print(f"\nResults for jdk: {jdk} and opts: {javaOpts}")
+    if startIter > 0:
+        print("First run is a cold run and is not included in the stats")
     thrAvgResults = [math.nan for i in range(numIter)] # np.full((numIter), fill_value=np.nan, dtype=np.float)
     for iter in range(numIter):
         print("Run", iter, end="")
@@ -671,7 +676,7 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     for pulse in range(numPulses):
         total = 0
         numValidEntries = 0
-        for iter in range(numIter):
+        for iter in range(startIter, numIter):
             if not math.isnan(thrResults[iter][pulse]):
                 total += thrResults[iter][pulse]
                 numValidEntries += 1
@@ -681,21 +686,21 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     for pulse in range(numPulses):
         print("\t{thr:7.1f}".format(thr=verticalAverages[pulse]), end="")
     print("\tThr={avgThr:7.1f}  RSS={rss:7.0f} MB  CompCPU={cpu:5.1f} sec  Startup={startup:5.0f} ms".
-          format(avgThr=nanmean(thrAvgResults), rss=nanmean(rssResults), cpu=nanmean(cpuResults), startup=nanmean(startupResults)))
+          format(avgThr=nanmean(thrAvgResults[startIter:]), rss=nanmean(rssResults[startIter:]), cpu=nanmean(cpuResults[startIter:]), startup=nanmean(startupResults[startIter:])))
     # Throughput stats
-    avg, stdDev, min, max, ci95, numSamples = computeStats(thrAvgResults)
+    avg, stdDev, min, max, ci95, numSamples = computeStats(thrAvgResults[startIter:])
     print("Throughput stats: Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
     # Footprint stats
-    avg, stdDev, min, max, ci95, numSamples = computeStats(rssResults)
+    avg, stdDev, min, max, ci95, numSamples = computeStats(rssResults[startIter:])
     print("Footprint stats:  Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
     # CompCPU stats
-    avg, stdDev, min, max, ci95, numSamples = computeStats(cpuResults)
+    avg, stdDev, min, max, ci95, numSamples = computeStats(cpuResults[startIter:])
     print("Comp CPU stats:   Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
     # Start-up stats
-    avg, stdDev, min, max, ci95, numSamples = computeStats(startupResults)
+    avg, stdDev, min, max, ci95, numSamples = computeStats(startupResults[startIter:])
     print("StartupTime stats:Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
 
@@ -716,7 +721,9 @@ cleanup()
 # Database needs to be started only once
 startDatabase(dbMachine, dbUsername, startDbScript)
 
-if doColdRun:
+if doOnlyColdRuns:
+    print("Will do a cold run before each tun")
+elif doColdRun:
     print("Will do a cold run before each set")
 
 for jvmOpts in jvmOptions:

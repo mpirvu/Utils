@@ -7,16 +7,27 @@
 import re # for regular expressions
 import sys # for accessing parameters and exit
 
+################## Configuration #####################
 # Compilations that take more than this value (in usec) are printed on screen
-compTimeThreshold = 10000000
+compTimeThreshold = 5000000
+
 # The following boolean controls whether vlog parsing should stop after JVM detects end of start-up
 analyzeOnlyStartup = False
+
 # If set to True, the script will print all AOT loads that were not followed by a recompilation
 # as well as all AOT loads that were followed by a recompilation
 printAOTLoadsNotRecompiled = False
 
+# The following boolean controls whether the script should print the CDF
+# for compilation times. The CDF is printed in a file named cdf.txt
+# and has a resolution of 5%. Each line in this file specifies that
+# N most expensive compilations took X% of the total compilation time,
+# where X is incremeted by 5 percentage points until it reaches 100%.
+printCompTimeCDF = True
+compTimeCDFFilename = "cdf.txt"
 
 
+#######################################################
 # Dictionary that maps opt levels from vlog into shorter names
 knownOptLevels = {
     "AOT load"          : " aotl",
@@ -80,6 +91,7 @@ def parseVlog(vlog):
     veryLongCompilations = []
     compilationWasDisabled = False
     numInterpreted = 0 # number of messages "will continue as interpreted"
+    methodCompTimes = {} # hash that maps method names to compilation times
 
     #  (cold) Compiling java/lang/Double.longBitsToDouble(J)D  OrdinaryMethod j9m=0000000000097B18 t=20 compThreadID=0 memLimit=262144 KB freePhysicalMemory=75755 MB
     compStartPattern = re.compile('^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
@@ -129,6 +141,12 @@ def parseVlog(vlog):
             bodySize = methodEndAddr - methodStartAddr
             assert bodySize > 0, "Method size must be positive"
             compBodySizes.append(bodySize)
+
+            if printCompTimeCDF:
+                mName = methodName + "_" + str(usec)
+                if mName in methodCompTimes:
+                    mName = mName + "_2" # hack just in case two methods have the same name and compilation time
+                methodCompTimes[mName] = usec
 
             if " GCR " in line:
                 numGCRBodies += 1
@@ -286,6 +304,28 @@ def parseVlog(vlog):
         sortedMethods = sorted(aotLoadsRecompiled)
         for method in sortedMethods:
             print(method)
+
+    if printCompTimeCDF:
+        # Sort our methodCompTimes hash by compilation time
+        sortedMethodCompTimes = sorted(methodCompTimes.items(), key=lambda kv: kv[1], reverse=True)
+        # Iterate through the sorted hash and print the CDF
+        print("\nWill print compilation time CDF into file", compTimeCDFFilename, "\n ")
+        cdfFile = open(compTimeCDFFilename, "w")
+        cdfFile.write("CDF for compilation times\n")
+        totalCompTime = sum(compTimes)
+        totalCompilations = len(compTimes)
+        crtCompTime = 0
+        nextTarget = 5.0
+        compCounter = 0
+        for methodTuple in sortedMethodCompTimes:
+            compCounter += 1
+            crtCompTime += methodTuple[1]
+            percentage = crtCompTime * 100.0 / totalCompTime
+            if percentage >= nextTarget:
+                cdfFile.write("{n:7d} methods took {p:4.1f}% of total compilation time\n".format(n=compCounter, p=percentage))
+                nextTarget += 5.0
+        cdfFile.close()
+
 
 ###################################################
 

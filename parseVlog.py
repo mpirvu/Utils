@@ -9,7 +9,7 @@ import sys # for accessing parameters and exit
 
 ################## Configuration #####################
 # Compilations that take more than this value (in usec) are printed on screen
-compTimeThreshold = 5000000
+compTimeThreshold = 500000
 
 # The following boolean controls whether vlog parsing should stop after JVM detects end of start-up
 analyzeOnlyStartup = False

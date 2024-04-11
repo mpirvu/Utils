@@ -9,7 +9,7 @@ import sys # for accessing parameters and exit
 
 ################## Configuration #####################
 # Compilations that take more than this value (in usec) are printed on screen
-compTimeThreshold = 500000
+compTimeThreshold = 1000000
 
 # The following boolean controls whether vlog parsing should stop after JVM detects end of start-up
 analyzeOnlyStartup = False
@@ -18,12 +18,17 @@ analyzeOnlyStartup = False
 # as well as all AOT loads that were followed by a recompilation
 printAOTLoadsNotRecompiled = False
 
+# If set to True, the script will print all first time compilations that are:
+# (1) not AOT loads (2) not JNI (3) not DLT (4) not caused by AOT load failures
+# The goal is to identify reasons for why we cannot have more AOT loads
+printFirstCompilationsNonAOTLoads = False
+
 # The following boolean controls whether the script should print the CDF
 # for compilation times. The CDF is printed in a file named cdf.txt
 # and has a resolution of 5%. Each line in this file specifies that
 # N most expensive compilations took X% of the total compilation time,
 # where X is incremeted by 5 percentage points until it reaches 100%.
-printCompTimeCDF = True
+printCompTimeCDF = False
 compTimeCDFFilename = "cdf.txt"
 
 
@@ -92,6 +97,7 @@ def parseVlog(vlog):
     compilationWasDisabled = False
     numInterpreted = 0 # number of messages "will continue as interpreted"
     methodCompTimes = {} # hash that maps method names to compilation times
+    firstTimeCompsExplainNonAOTLoad = {} # hash that maps method names to a tuple {vlogCompLine, AOTLoadFail?, JNI?, AOTLoad?, FollowAOTLoadFail}
 
     #  (cold) Compiling java/lang/Double.longBitsToDouble(J)D  OrdinaryMethod j9m=0000000000097B18 t=20 compThreadID=0 memLimit=262144 KB freePhysicalMemory=75755 MB
     compStartPattern = re.compile('^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
@@ -182,6 +188,18 @@ def parseVlog(vlog):
                         # and add to set of recompiled AOT loads
                         aotLoadsRecompiled.add(methodName)
 
+            # Logic for determining the first time compilations that are not AOT loads
+            # DLT compilations are special and they should be totally ignored
+            if printFirstCompilationsNonAOTLoads and not " DLT" in line:
+                if methodName not in firstTimeCompsExplainNonAOTLoad:
+                    # First time compilation
+                    firstTimeCompsExplainNonAOTLoad[methodName] =  {"line": line, "AOTLoadFail":False, "FollowAOTLoadFail":False, "JNI":" JNI " in line, "AOTLoad":"AOT load" in line}
+                else:
+                    # Recomps and compilations following AOT load failures can be ignored
+                    info = firstTimeCompsExplainNonAOTLoad[methodName]
+                    if info["AOTLoadFail"]:
+                        info["FollowAOTLoadFail"] = True
+
         else: # Check for compilation failures
             if line.startswith("!"):
                 m = compFailPattern.match(line)
@@ -204,6 +222,12 @@ def parseVlog(vlog):
                     if match:
                         qSZ = int(match.group(1))
                         maxQSZ = max(maxQSZ, qSZ)
+                    if printFirstCompilationsNonAOTLoads and not " DLT" in line:
+                        # Look for first time compilations that are AOT loads that failed
+                        if methodName not in firstTimeCompsExplainNonAOTLoad:
+                            if "AOT load" in line:
+                                firstTimeCompsExplainNonAOTLoad[methodName] =  {"line": line, "AOTLoadFail":True, "FollowAOTLoadFail":False, "JNI":" JNI " in line, "AOTLoad":False}
+
                 else:
                     # Failure line that is not matched could look like
                     # ! sun/misc/Unsafe.ensureClassInitialized(Ljava/lang/Class;)V cannot be translated
@@ -326,7 +350,13 @@ def parseVlog(vlog):
                 nextTarget += 5.0
         cdfFile.close()
 
-
+    if printFirstCompilationsNonAOTLoads:
+        print("\nFirst time compilations that are not AOT loads:")
+        for method, info in firstTimeCompsExplainNonAOTLoad.items():
+            if not info["AOTLoad"] and not info["JNI"] and not info["FollowAOTLoadFail"]:
+                # Also ignore AOT compilations and EDO triggerred compilations
+                if not ("+ (AOT" in info["line"]) and not (" EDO " in info["line"]):
+                    print(info["line"], end='')
 ###################################################
 
 

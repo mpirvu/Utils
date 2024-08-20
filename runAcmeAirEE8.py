@@ -389,15 +389,20 @@ def verifyAppserverStarted():
     errPattern = re.compile('.+\[ERROR')
     readyPattern = re.compile(".+is ready to run a smarter planet")
     for iter in range(20):
-        with open(logFile) as f:
-            for line in f:
-                m = errPattern.match(line)
-                if m:
-                    logging.warning("AppServer {applicationName} errored while starting:\n\t {line}").format(applicationName=applicationName,line=line)
-                    return False
-                m1 = readyPattern.match(line)
-                if m1:
-                    return True # True means success
+        try:
+            with open(logFile) as f:
+                for line in f:
+                    print(line)
+                    m = errPattern.match(line)
+                    if m:
+                        logging.warning("AppServer {applicationName} errored while starting:\n\t {line}").format(applicationName=applicationName,line=line)
+                        return False
+                    m1 = readyPattern.match(line)
+                    if m1:
+                        return True # True means success
+        except IOError:
+            print("Could not open file", logFile)
+            return False
         logging.warning("sleeping 1 sec and trying again")
         time.sleep(1) # wait 1 sec and try again
     return False # False means failure
@@ -422,15 +427,22 @@ def startAppServer(jdk, jvmArgs):
     childProcess = subprocess.Popen(shlex.split(appServerStartCmd), env=myEnv, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     logging.debug(f"Waiting for {startupWaitTime} sec for the AppServer to start")
     time.sleep(startupWaitTime)
+    startOK = False
     if childProcess.poll() is None: # It's running
         logging.debug("AppServer started with pid {pid}".format(pid=childProcess.pid))
-    # Verify that server started correctly
-    startOK = verifyAppserverStarted()
-    if not startOK:
-        logging.error("AppServer did not start correctly")
-        killAppServerIfRunning(childProcess)
+        # Verify that server started correctly
+        startOK = verifyAppserverStarted()
+        if not startOK:
+            logging.error("AppServer did not start correctly")
+            outs, errs = childProcess.communicate(timeout=15)
+            print(outs)
+            killAppServerIfRunning(childProcess)
+            return None
+        else:
+            logging.debug("AppServer started OK")
+    else:
+        logging.error("AppServer did not start")
         return None
-    logging.debug("AppServer started OK")
     return childProcess
 
 
@@ -599,6 +611,7 @@ def runBenchmarkOnce(jdk, jvmArgs, doMemAnalysis):
     maxPulses = numRepetitionsOneClient + numRepetitions50Clients
     thrResults = [math.nan for i in range(maxPulses)] # np.full((maxPulses), fill_value=np.nan, dtype=np.float)
     rss, peakRss, cpu, startupTime = math.nan, math.nan, math.nan, math.nan
+    peakThroughput = math.nan
 
     restoreDatabase(dbMachine, dbUsername)
 
@@ -607,7 +620,7 @@ def runBenchmarkOnce(jdk, jvmArgs, doMemAnalysis):
 
     childProcess = startAppServer(jdk=jdk, jvmArgs=jvmArgs)
     if childProcess is None: # Failed to start properly
-        return thrResults, rss, peakRss, cpu, startupTime
+        return thrResults, peakThroughput, rss, peakRss, cpu, startupTime
 
     # Compute AppServer start-up time
     startupTime = getStartupTime(startTimeMs)
@@ -678,7 +691,7 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
         thrList, peakThr, rss, peakRss, cpu, startupTime = runBenchmarkOnce(jdk, javaOpts, doMemAnalysis)
         lastThr = meanLastValues(thrList, numMeasurementTrials) # average for last N pulses
         print(f"Run {iter}: Thr={lastThr:6.1f} RSS={rss:6.1f} MB  PeakRSS={peakRss:6.1f} MB  CPU={cpu:4.1f} sec  Startup={startupTime:5.0f} PeakThr={peakThr:6.1f}".
-              format(lastThr=lastThr, rss=rss, peakRss=peakRss, cpu=cpu, startupTime=startupTime, peakThr=peakThr))
+              format(lastThr=lastThr, rss=rss, peakRss=peakRss, cpu=cpu, startupTime=startupTime, peakThr=peakThr), flush=True)
         thrResults.append(thrList) # copy all the pulses
         rssResults.append(rss)
         cpuResults.append(cpu)

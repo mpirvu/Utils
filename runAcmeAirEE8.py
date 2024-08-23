@@ -41,7 +41,7 @@ extraArgsForMemAnalysis = f" -Dcom.ibm.dbgmalloc=true -Xdump:none -Xdump:system:
 collectPerfProfileForJIT = False # Collect perf profile of the "main" compilation thread
 collectPerfProfileForJVM = False  # Collect perf profile for the entire JVM
 perfProfileOutput = "/tmp/perf.data"
-perfCmd= f"perf record -e cycles -c 200000 -o {perfProfileOutput}"
+perfCmd= f"perf record -e cycles -c 200000"
 perfDuration = 300 # seconds
 
 
@@ -340,7 +340,8 @@ def collectJITPerfProfile(javaPID):
         return
     # Get the JIT perf profile in the background
     perfProcess = None
-    cmd = f"{perfCmd} --tid {compThreadTID} -- sleep {perfDuration}"
+    outputFile = f"{perfProfileOutput}.{javaPID}"
+    cmd = f"{perfCmd} -o {outputFile} --tid {compThreadTID} -- sleep {perfDuration}"
     try:
         # Fork a process and run in background
         perfProcess = subprocess.Popen(shlex.split(cmd), universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -355,7 +356,8 @@ def collectJITPerfProfile(javaPID):
 
 def collectJVMPerfProfile(javaPID):
     perfProcess = None
-    cmd = f"{perfCmd} --pid {javaPID} --delay=5000 -- sleep {perfDuration}"
+    outputFile = f"{perfProfileOutput}.{javaPID}"
+    cmd = f"{perfCmd} -o {outputFile} --pid {javaPID} --delay=5000 -- sleep {perfDuration}"
     try:
         # Fork a process and run in background
         perfProcess = subprocess.Popen(shlex.split(cmd), universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

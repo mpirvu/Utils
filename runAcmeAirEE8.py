@@ -412,7 +412,7 @@ def verifyAppserverStarted():
 
 def killAppServerIfRunning(childProcess):
     if childProcess.poll() is None: # Still running
-        logging.error("Killing AppServer")
+        logging.error("Killing server")
         childProcess.kill()
         childProcess.wait()
 
@@ -503,6 +503,30 @@ def getCompCPU(childProcess):
             threadTime += float(m.group(1))
     return threadTime/1000.0 if threadTime > 0 else math.nan
 
+
+def startJITServer(jdk):
+    jitServerCmd = f"{jdk}/bin/jitserver"
+    logging.info("Starting JITServer with command: {jitServerCmd}".format(jitServerCmd=jitServerCmd))
+    myEnv = os.environ.copy()
+    # Fork a process and run in background
+    childProcess = subprocess.Popen(shlex.split(jitServerCmd), env=myEnv, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(1) # Give server some time to start
+    # Check that server started correctly
+    if childProcess.poll() is None: # No return code means the process is still running
+        return childProcess
+    else:
+        logging.error("JITServer did not start correctly")
+        return None
+
+def stopJITServer(jitServerProcess):
+    logging.info("Stopping JITServer...")
+    if jitServerProcess.poll() is None: # No return code means the process is still running
+        jitServerProcess.terminate()
+        try:
+            jitServerProcess.communicate(timeout=15) # Using communicate instead of wait to avoid deadlock
+        except subprocess.TimeoutExpired:
+            logging.info("Stopping JITServer forcefully with sigkill")
+            killAppServerIfRunning(jitServerProcess)
 
 def applyLoad(duration, numClients):
     # Run jmeter remotely
@@ -685,6 +709,9 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     if doColdRun or doOnlyColdRuns:
         clearSCC(jdk, sccDestroyParams)
 
+    # Start JITServer if needed
+    jitServerHandle = startJITServer(jdk) if "-XX:+UseJITServer" in javaOpts else None
+
     for iter in range(numIter):
         # if memAnalysis is True, add the options required for memory analysis, but only for the last iteration
         doMemAnalysis = memAnalysis and iter == numIter - 1
@@ -745,6 +772,9 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     avg, stdDev, min, max, ci95, numSamples = computeStats(startupResults[startIter:])
     print("StartupTime stats:Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
+
+    if jitServerHandle:
+        stopJITServer(jitServerHandle)
 
 def cleanup():
     stopContainersFromImage(dbMachine, dbUsername, dbImage)

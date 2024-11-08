@@ -55,15 +55,16 @@ dbMachine          = "localhost"
 dbUsername         = "" # To connect to mongoMachine remotely; leave empty to connect without ssh
 dbImage            = "localhost/mongo-acmeair-ee8:5.0.15"
 dbContainerName    = "mongodb"
-startDbScript      = f"{docker} run --rm -d --name {dbContainerName} --network=host {dbImage} --nojournal"
+dbAffinity         = "24-31"
+startDbScript      = f"{docker} run --rm -d --cpuset-cpus={dbAffinity} --name {dbContainerName} --network=host {dbImage} --nojournal"
 
 ############### JMeter CONFIG ###############
 jmeterMachine       = "localhost"
 jmeterUsername      = "" # To connect to JMeter machine; leave empty to connect without ssh
 jmeterImage         = "localhost/jmeter-acmeair:5.3"
 jmeterContainerName = "jmeter"
-jmeterAffinity      = "2-3"
-printRampup         = False # If True, print all JMeter throughput values to plot rampup curve
+jmeterAffinity      = "16-19"
+printRampup         =  False # If True, print all JMeter throughput values to plot rampup curve
 
 ################ Load CONFIG ###############
 numRepetitionsOneClient = 0
@@ -161,7 +162,7 @@ def eliminateNans(myList):
 Receives an array reference with results.
 We compute the lower and and upper quartile, then compute the interquartile
 range (IQR=Q3-Q1) and the lower (Q1 - 1.5*IQR) and upper (Q3 + 1.5*IQR) fences.
-The two fences are returned to the caller in an array with 2 elements. The third element is the median.
+The two fences are returned to the caller in an array with 2 elements.
 Needs at least 4 data points
 '''
 def computeOutlierFences(myList):
@@ -570,7 +571,7 @@ def stopJITServer(jitServerProcess):
 
 def applyLoad(duration, numClients):
     # Run jmeter remotely
-    remoteCmd = f"{docker} run -d --network=host -e JTHREAD={numClients} -e JDURATION={duration} -e JUSER={maxUsers} -e JHOST={AppServerHost} -e JPORT={AppServerPort} --name {jmeterContainerName} {jmeterImage}"
+    remoteCmd = f"{docker} run -d --network=host --cpuset-cpus={jmeterAffinity} -e JTHREAD={numClients} -e JDURATION={duration} -e JUSER={maxUsers} -e JHOST={AppServerHost} -e JPORT={AppServerPort} --name {jmeterContainerName} {jmeterImage}"
     cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\"" if jmeterUsername else remoteCmd
     logging.info("Apply load: {cmd}".format(cmd=cmd))
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)

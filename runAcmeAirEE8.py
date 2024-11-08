@@ -8,6 +8,7 @@ import math
 import os # for environment variables
 import re # for regular expressions
 import shlex, subprocess
+import statistics
 import sys # for number of arguments
 import time # for sleep
 from collections import deque
@@ -98,8 +99,8 @@ jdks = [
 
 def count_not_nan(myList):
     total = 0
-    for i in range(len(myList)):
-        if not math.isnan(myList[i]):
+    for elem in myList:
+        if not math.isnan(elem):
             total += 1
     return total
 
@@ -149,6 +150,27 @@ def nanmax(myList):
             max = myList[i]
     return max
 
+'''
+Given an input list of values, eliminate all NaNs and return a new list
+'''
+def eliminateNans(myList):
+    return [value for value in myList if not math.isnan(value)]
+
+
+'''
+Receives an array reference with results.
+We compute the lower and and upper quartile, then compute the interquartile
+range (IQR=Q3-Q1) and the lower (Q1 - 1.5*IQR) and upper (Q3 + 1.5*IQR) fences.
+The two fences are returned to the caller in an array with 2 elements. The third element is the median.
+Needs at least 4 data points
+'''
+def computeOutlierFences(myList):
+    Q1, Q2, Q3 = statistics.quantiles(myList, n = 4, method='inclusive')
+    # Compute the interquartile range
+    IQR = Q3 - Q1
+    lowerFence = Q1 - 3 * IQR
+    upperFence  = Q3 + 3 * IQR
+    return (lowerFence, upperFence)
 
 def tDistributionValue95(degreeOfFreedom):
     if degreeOfFreedom < 1:
@@ -162,7 +184,7 @@ def tDistributionValue95(degreeOfFreedom):
         return tValues[degreeOfFreedom-1]
     else:
         if degreeOfFreedom <= 60:
-            return 2.042 - 0.001 * (degreeOfFreedom - 30)
+            return 2.042 - 0.0014 * (degreeOfFreedom - 30)
         else:
             return 1.96
 
@@ -179,14 +201,32 @@ def meanConfidenceInterval95(myList):
     return 100.0*marginOfError/avg
 
 
-def computeStats(myList):
-    avg = nanmean(myList)
-    stdDev = nanstd(myList)
-    min = nanmin(myList)
-    max = nanmax(myList)
-    ci95 = meanConfidenceInterval95(myList)
-    numValues = count_not_nan(myList)
-    return avg, stdDev, min, max, ci95, numValues
+def computeStats(myList, eliminateOutliers=False):
+    newList = eliminateNans(myList)
+    if len(newList) < 1:
+        return math.nan, math.nan, math.nan, math.nan, math.nan, 0, []
+    # Eliminate outliers
+    outlierList = []
+    goodValuesList = []
+    if eliminateOutliers:
+        lowerFence, upperFence = computeOutlierFences(newList)
+        for val in newList:
+            if val < lowerFence or val > upperFence:
+                outlierList.append(val)
+            else:
+                goodValuesList.append(val)
+    else:
+        goodValuesList = newList
+    avg = statistics.fmean(goodValuesList)
+    stdDev = statistics.stdev(goodValuesList)
+    minVal = min(goodValuesList)
+    maxVal = max(goodValuesList)
+    numSamples = len(goodValuesList)
+    tvalue = tDistributionValue95(numSamples-1)
+    marginOfError = tvalue * stdDev / math.sqrt(numSamples)
+    ci95 = 100.0*marginOfError/avg
+
+    return avg, stdDev, minVal, maxVal, ci95, numSamples, outlierList
 
 
 def meanLastValues(myList, numLastValues):
@@ -757,19 +797,19 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     print("\tThr={avgThr:7.1f}  RSS={rss:7.0f} MB  CompCPU={cpu:5.1f} sec  Startup={startup:5.0f} ms".
           format(avgThr=nanmean(thrAvgResults[startIter:]), rss=nanmean(rssResults[startIter:]), cpu=nanmean(cpuResults[startIter:]), startup=nanmean(startupResults[startIter:])))
     # Throughput stats
-    avg, stdDev, min, max, ci95, numSamples = computeStats(thrAvgResults[startIter:])
+    avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(thrAvgResults[startIter:], eliminateOutliers=True)
     print("Throughput stats: Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
     # Footprint stats
-    avg, stdDev, min, max, ci95, numSamples = computeStats(rssResults[startIter:])
+    avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(rssResults[startIter:], eliminateOutliers=True)
     print("Footprint stats:  Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
     # CompCPU stats
-    avg, stdDev, min, max, ci95, numSamples = computeStats(cpuResults[startIter:])
+    avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(cpuResults[startIter:], eliminateOutliers=True)
     print("Comp CPU stats:   Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
     # Start-up stats
-    avg, stdDev, min, max, ci95, numSamples = computeStats(startupResults[startIter:])
+    avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(startupResults[startIter:], eliminateOutliers=True)
     print("StartupTime stats:Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
 

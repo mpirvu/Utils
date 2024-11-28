@@ -209,7 +209,7 @@ def computeStats(myList, eliminateOutliers=False):
     # Eliminate outliers
     outlierList = []
     goodValuesList = []
-    if eliminateOutliers:
+    if eliminateOutliers and len(newList) > 3:
         lowerFence, upperFence = computeOutlierFences(newList)
         for val in newList:
             if val < lowerFence or val > upperFence:

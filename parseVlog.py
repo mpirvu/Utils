@@ -100,6 +100,7 @@ def parseVlog(vlog):
     veryLongCompilations = []
     methodCompTimes = {} # hash that maps method names to compilation times
     firstTimeCompsExplainNonAOTLoad = {} # hash that maps method names to a tuple {vlogCompLine, AOTLoadFail?, JNI?, AOTLoad?, FollowAOTLoadFail}
+    startTime = 0 # ms
 
     #  (cold) Compiling java/lang/Double.longBitsToDouble(J)D  OrdinaryMethod j9m=0000000000097B18 t=20 compThreadID=0 memLimit=262144 KB freePhysicalMemory=75755 MB
     compStartPattern = re.compile('^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
@@ -113,32 +114,38 @@ def parseVlog(vlog):
     scratchMemPattern = re.compile('^.+mem=\[region=(\d+) system=(\d+)\]KB')
     # Parse the vlog
     for line in vlog:
-        if analyzeOnlyStartup and "VM changed state to NOT_STARTUP" in line:
-            break
-        if dontAnalyzeStartup and "VM changed state to NOT_STARTUP" in line:
-            # reset all compilation stats
-            maxCompLine = "" # Remember the compilation that took the longest
-            maxCompTime = 0
-            maxQSZ = 0
-            numGCRBodies = 0
-            numGCR = 0
-            numSync = 0
-            numDLT = 0
-            numRemote = 0
-            numDeserialized = 0
-            numLocalNonAOTLoad = 0
-            maxJvmCPU = 0
-            minFreeMem = sys.maxsize
-            maxScratchMem = 0
-            maxRegionMem = 0
-            numLowPhysicalMemEvents = 0
-            numRecomp = 0
-            compilationWasDisabled = False
-            numInterpreted = 0 # number of messages "will continue as interpreted"
-            compTimes = [] # List with compilation times
-            compTimesPerLevel = {} # the key of this hash is the name of the optimization level
-            compBodySizes = [] # List with sizes of the compiled bodies
-            continue
+        # #JITSTATE:  t=  6544 VM changed state to NOT_STARTUP
+        if "VM changed state to NOT_STARTUP" in line: # start-up point detected
+            # Determine the start time
+            m = re.match("#JITSTATE:\s+t=\s*(\d+)\s+VM", line)
+            if m:
+                startTime = int(m.group(1))
+            if analyzeOnlyStartup:
+                break
+            if dontAnalyzeStartup:
+                # reset all compilation stats
+                maxCompLine = "" # Remember the compilation that took the longest
+                maxCompTime = 0
+                maxQSZ = 0
+                numGCRBodies = 0
+                numGCR = 0
+                numSync = 0
+                numDLT = 0
+                numRemote = 0
+                numDeserialized = 0
+                numLocalNonAOTLoad = 0
+                maxJvmCPU = 0
+                minFreeMem = sys.maxsize
+                maxScratchMem = 0
+                maxRegionMem = 0
+                numLowPhysicalMemEvents = 0
+                numRecomp = 0
+                compilationWasDisabled = False
+                numInterpreted = 0 # number of messages "will continue as interpreted"
+                compTimes = [] # List with compilation times
+                compTimesPerLevel = {} # the key of this hash is the name of the optimization level
+                compBodySizes = [] # List with sizes of the compiled bodies
+                continue
         m = compEndPattern.match(line)
         if m:
             # First group is the opt level
@@ -336,7 +343,8 @@ def parseVlog(vlog):
         print("Methods that remain interpreted after a failure:")
         for method in failedMethods:
             print(method)
-    print("LastTimeStamp =", crtTimeMs, "ms")
+    print("Start Timestamp =", startTime, "ms")
+    print("Last TimeStamp  =", crtTimeMs, "ms")
     if len(veryLongCompilations) > 0:
         print("\nVery long compilations:")
         for l in veryLongCompilations:

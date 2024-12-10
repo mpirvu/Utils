@@ -13,6 +13,8 @@ compTimeThreshold = 1000000
 
 # The following boolean controls whether vlog parsing should stop after JVM detects end of start-up
 analyzeOnlyStartup = False
+# Exclude the start-up from the analysis
+dontAnalyzeStartup = False
 
 # If set to True, the script will print all AOT loads that were not followed by a recompilation
 # as well as all AOT loads that were followed by a recompilation
@@ -83,6 +85,9 @@ def parseVlog(vlog):
     maxScratchMem = 0
     maxRegionMem = 0
     numLowPhysicalMemEvents = 0
+    numRecomp = 0
+    compilationWasDisabled = False
+    numInterpreted = 0 # number of messages "will continue as interpreted"
     compTimes = [] # List with compilation times
     compTimesPerLevel = {} # the key of this hash is the name of the optimization level
     compBodySizes = [] # List with sizes of the compiled bodies
@@ -91,11 +96,8 @@ def parseVlog(vlog):
     recompMethods = set() # set for computing the number of recompilations
     aotLoadsNotRecompiled = set()
     aotLoadsRecompiled = set()
-    numRecomp = 0
     crtTimeMs = 0 # current time in millis since the start of the JVM
     veryLongCompilations = []
-    compilationWasDisabled = False
-    numInterpreted = 0 # number of messages "will continue as interpreted"
     methodCompTimes = {} # hash that maps method names to compilation times
     firstTimeCompsExplainNonAOTLoad = {} # hash that maps method names to a tuple {vlogCompLine, AOTLoadFail?, JNI?, AOTLoad?, FollowAOTLoadFail}
 
@@ -113,6 +115,30 @@ def parseVlog(vlog):
     for line in vlog:
         if analyzeOnlyStartup and "VM changed state to NOT_STARTUP" in line:
             break
+        if dontAnalyzeStartup and "VM changed state to NOT_STARTUP" in line:
+            # reset all compilation stats
+            maxCompLine = "" # Remember the compilation that took the longest
+            maxCompTime = 0
+            maxQSZ = 0
+            numGCRBodies = 0
+            numGCR = 0
+            numSync = 0
+            numDLT = 0
+            numRemote = 0
+            numDeserialized = 0
+            numLocalNonAOTLoad = 0
+            maxJvmCPU = 0
+            minFreeMem = sys.maxsize
+            maxScratchMem = 0
+            maxRegionMem = 0
+            numLowPhysicalMemEvents = 0
+            numRecomp = 0
+            compilationWasDisabled = False
+            numInterpreted = 0 # number of messages "will continue as interpreted"
+            compTimes = [] # List with compilation times
+            compTimesPerLevel = {} # the key of this hash is the name of the optimization level
+            compBodySizes = [] # List with sizes of the compiled bodies
+            continue
         m = compEndPattern.match(line)
         if m:
             # First group is the opt level

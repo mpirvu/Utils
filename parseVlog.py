@@ -88,6 +88,7 @@ def parseVlog(vlog):
     numRecomp = 0
     compilationWasDisabled = False
     numInterpreted = 0 # number of messages "will continue as interpreted"
+    interpretedMethods = set() # set of methods that will continue as interpreted
     compTimes = [] # List with compilation times
     compTimesPerLevel = {} # the key of this hash is the name of the optimization level
     compBodySizes = [] # List with sizes of the compiled bodies
@@ -142,9 +143,10 @@ def parseVlog(vlog):
                 numRecomp = 0
                 compilationWasDisabled = False
                 numInterpreted = 0 # number of messages "will continue as interpreted"
-                compTimes = [] # List with compilation times
-                compTimesPerLevel = {} # the key of this hash is the name of the optimization level
-                compBodySizes = [] # List with sizes of the compiled bodies
+                interpretedMethods.clear()
+                compTimes.clear() # List with compilation times
+                compTimesPerLevel.clear() # the key of this hash is the name of the optimization level
+                compBodySizes.clear() # List with sizes of the compiled bodies
                 continue
         m = compEndPattern.match(line)
         if m:
@@ -260,7 +262,6 @@ def parseVlog(vlog):
                         if methodName not in firstTimeCompsExplainNonAOTLoad:
                             if "AOT load" in line:
                                 firstTimeCompsExplainNonAOTLoad[methodName] =  {"line": line, "AOTLoadFail":True, "FollowAOTLoadFail":False, "JNI":" JNI " in line, "AOTLoad":False}
-
                 else:
                     # Failure line that is not matched could look like
                     # ! sun/misc/Unsafe.ensureClassInitialized(Ljava/lang/Class;)V cannot be translated
@@ -282,7 +283,6 @@ def parseVlog(vlog):
                     if match:
                         crtTimeMs = int(match.group(1))
 
-
         m = jvmCpuPattern.match(line)
         if m:
             jvmCPU = int(m.group(1))
@@ -301,9 +301,14 @@ def parseVlog(vlog):
             numLowPhysicalMemEvents += 1
         if "Disable further compilation" in line:
             compilationWasDisabled = True
+        #INFO:  Method jdk/internal/loader/NativeLibraries.load(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZZ)Z will continue as interpreted
         if "will continue as interpreted" in line:
+            m = re.match("#INFO:\s+Method (\S+) will continue as interpreted", line)
+            if m:
+                interpretedMethods.add(m.group(1))
+            else:
+                print("Interpreted method could not be identified from line:", line)
             numInterpreted += 1
-
 
     # Print statistics
     printHeaderStats()
@@ -342,7 +347,10 @@ def parseVlog(vlog):
     if len(failedMethods) > 0:
         print("Methods that remain interpreted after a failure:")
         for method in failedMethods:
-            print(method)
+            # Method could have been compiled and a recompilation could have failed
+            # Those failures don't result in an interpreted method
+            if method not in recompMethods:
+                print(method)
     print("Start Timestamp =", startTime, "ms")
     print("Last TimeStamp  =", crtTimeMs, "ms")
     if len(veryLongCompilations) > 0:
@@ -352,7 +360,9 @@ def parseVlog(vlog):
     if compilationWasDisabled:
         print("WARNING: compilation was disabled at some point during JVM lifetime")
     if numInterpreted > 0:
-        print(numInterpreted, "methods will continue as interpreted")
+        print(numInterpreted, "methods will continue as interpreted due to compilation filters")
+        for method in interpretedMethods:
+            print("\t", method)
     if printAOTLoadsNotRecompiled:
         print("\nAOT loads that were not recompiled:")
         sortedMethods = sorted(aotLoadsNotRecompiled)

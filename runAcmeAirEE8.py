@@ -747,13 +747,15 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     startupResults = []
 
     # clear SCC if needed (by destroying the SCC volume)
-    if doColdRun or doOnlyColdRuns:
+    if doColdRun:
         clearSCC(jdk, sccDestroyParams)
 
     # Start JITServer if needed
     jitServerHandle = startJITServer(jdk) if "-XX:+UseJITServer" in javaOpts else None
 
     for iter in range(numIter):
+        if doOnlyColdRuns:
+            clearSCC(jdk, sccDestroyParams)
         # if memAnalysis is True, add the options required for memory analysis, but only for the last iteration
         doMemAnalysis = memAnalysis and iter == numIter - 1
         if doMemAnalysis:

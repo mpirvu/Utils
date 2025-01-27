@@ -180,8 +180,10 @@ def parseVlog(vlog):
                 compTimesPerLevel[levelName] = [usec]
 
             bodySize = methodEndAddr - methodStartAddr
-            assert bodySize > 0, "Method size must be positive"
-            compBodySizes.append(bodySize)
+            if bodySize > 0:
+                compBodySizes.append(bodySize)
+            else:
+                print("Warning: detected negative body size in line", line)
 
             if printCompTimeCDF:
                 mName = methodName + "_" + str(usec)

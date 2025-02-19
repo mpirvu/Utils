@@ -104,21 +104,21 @@ def parseVlog(vlog):
     startTime = 0 # ms
 
     #  (cold) Compiling java/lang/Double.longBitsToDouble(J)D  OrdinaryMethod j9m=0000000000097B18 t=20 compThreadID=0 memLimit=262144 KB freePhysicalMemory=75755 MB
-    compStartPattern = re.compile('^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
+    compStartPattern = re.compile(r'^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
     # + (cold) sun/reflect/Reflection.getCallerClass()Ljava/lang/Class; @ 00007FB21300003C-00007FB213000167 OrdinaryMethod - Q_SZ=1 Q_SZI=1 QW=2 j9m=000000000004D1D8 bcsz=2 JNI time=995us mem=[region=704 system=2048]KB compThreadID=0 CpuLoad=163%(10%avg) JvmCpu=0%
     # + (AOT load) java/lang/String.lengthInternal()I @ 00007FA6F8001140-00007FA6F8001168 Q_SZ=1 Q_SZI=1 QW=2 j9m=00000000000493F8 bcsz=37 time=51us compThreadID=0 queueTime=293us
-    compEndPattern  = re.compile('^\+ \(([\S -]+)\) (\S+) \@ (0x)?([0-9A-F]+)-(0x)?([0-9A-F]+)\s.*Q_SZ=(\d+).+ time=(\d+)us')
+    compEndPattern  = re.compile(r'^\+ \(([\S -]+)\) (\S+) \@ (0x)?([0-9A-F]+)-(0x)?([0-9A-F]+)\s.*Q_SZ=(\d+).+ time=(\d+)us')
     # ! (cold) java/nio/Buffer.<init>(IIII)V Q_SZ=274 Q_SZI=274 QW=275 j9m=00000000000B3970 time=99us compilationAotClassReloFailure memLimit=206574 KB freePhysicalMemory=205 MB mem=[region=64 system=2048]KB compThreadID=0
-    compFailPattern = re.compile('^\! \(.+\) (\S+) .*time=(\d+)us (\S+) ')
-    jvmCpuPattern = re.compile('^.+jvmCPU=(\d+)', re.IGNORECASE)
-    freeMemPattern = re.compile('^.+freePhysicalMemory=(\d+) MB')
-    scratchMemPattern = re.compile('^.+mem=\[region=(\d+) system=(\d+)\]KB')
+    compFailPattern = re.compile(r'^\! \(.+\) (\S+) .*time=(\d+)us (\S+) ')
+    jvmCpuPattern = re.compile(r'^.+jvmCPU=(\d+)', re.IGNORECASE)
+    freeMemPattern = re.compile(r'^.+freePhysicalMemory=(\d+) MB')
+    scratchMemPattern = re.compile(r'^.+mem=\[region=(\d+) system=(\d+)\]KB')
     # Parse the vlog
     for line in vlog:
         # #JITSTATE:  t=  6544 VM changed state to NOT_STARTUP
         if "VM changed state to NOT_STARTUP" in line: # start-up point detected
             # Determine the start time
-            m = re.match("#JITSTATE:\s+t=\s*(\d+)\s+VM", line)
+            m = re.match(r"#JITSTATE:\s+t=\s*(\d+)\s+VM", line)
             if m:
                 startTime = int(m.group(1))
             if analyzeOnlyStartup:
@@ -305,7 +305,7 @@ def parseVlog(vlog):
             compilationWasDisabled = True
         #INFO:  Method jdk/internal/loader/NativeLibraries.load(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZZ)Z will continue as interpreted
         if "will continue as interpreted" in line:
-            m = re.match("#INFO:\s+Method (\S+) will continue as interpreted", line)
+            m = re.match(r"#INFO:\s+Method (\S+) will continue as interpreted", line)
             if m:
                 interpretedMethods.add(m.group(1))
             else:

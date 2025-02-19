@@ -1,11 +1,11 @@
 # Python script that parses an OpenJ9 verbose log and
-# prints a timeline of compilations grouped by opt level.
+# prints a timeline of compilation times grouped by opt level.
 # The printout consists of N columns separated by tabs
 # where the first column represents the timestamp and the
-# remaining columns represent the number of compilations
-# for a particular optimization level.
+# remaining columns represent the time spent in compilations
+# (in ms) for a particular optimization level.
 #
-# Usage: python3 CompTimeline.py vlogFilename
+# Usage: python3 CompTimeTimeline.py vlogFilename
 #
 # Author: Marius Pirvu
 
@@ -48,15 +48,15 @@ def printStatsPerOptLevel(header, compPerLevel):
     stringToPrint = header
     for opt in knownOptLevels.keys():
         levelName = knownOptLevels[opt]
-        numComp = compPerLevel.get(levelName, 0)
-        stringToPrint += "\t{numComp:5d}".format(numComp=numComp)
+        timeComp = (compPerLevel.get(levelName, 0)) // 1000 # convert to ms
+        stringToPrint += "\t{timeComp:5d}".format(timeComp=timeComp)
     print(stringToPrint)
 
 
 def parseVlog(vlog):
     printHeaderStats()
     # + (cold) sun/reflect/Reflection.getCallerClass()Ljava/lang/Class; @ 00007FB21300003C-00007FB213000167 OrdinaryMethod - Q_SZ=1 Q_SZI=1 QW=2 j9m=000000000004D1D8 bcsz=2 JNI time=995us mem=[region=704 system=2048]KB compThreadID=0 CpuLoad=163%(10%avg) JvmCpu=0%
-    compEndPattern  = re.compile(r'^\+ \(([\w\s-]+)\) (\S+) ')
+    compEndPattern  = re.compile(r'^\+ \(([\w\s-]+)\) (\S+) .+time=(\d+)us')
     # ! (cold) java/nio/Buffer.<init>(IIII)V Q_SZ=274 Q_SZI=274 QW=275 j9m=00000000000B3970 time=99us compilationAotClassReloFailure memLimit=206574 KB freePhysicalMemory=205 MB mem=[region=64 system=2048]KB compThreadID=0
     crtTimeMs = 0
     oldTimeMs = 0
@@ -82,9 +82,10 @@ def parseVlog(vlog):
             opt = match.group(1) # First group is the opt level
             assert opt in knownOptLevels, "Unknown opt level encountered: {opt}".format(opt=opt)
             levelName = knownOptLevels[opt]
+            compTime = int(match.group(3))
 
-            # Increment the number of compilations for given opt level
-            compPerLevel[levelName] = compPerLevel.get(levelName, 0) + 1
+            # Adjust the compilation time for given opt level
+            compPerLevel[levelName] = compPerLevel.get(levelName, 0) + compTime
 
 
 

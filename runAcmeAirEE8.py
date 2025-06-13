@@ -83,6 +83,7 @@ maxUsers                = 199 # Maximum number of simulated AcmeAir users
 #JITServerUsername = "" # To connect to JITServerMachine; leave empty for connecting without ssh
 #JITServerImage   = "liberty-acmeair-ee8:J17"
 #JITServerContainerName = "jitserver"
+JITServerOpts = "" # Extra options for the JITServer process
 ############################# END CONFIG ####################################
 
 
@@ -546,7 +547,7 @@ def getCompCPU(childProcess):
 
 
 def startJITServer(jdk):
-    jitServerCmd = f"{jdk}/bin/jitserver"
+    jitServerCmd = f"{jdk}/bin/jitserver {JITServerOpts}"
     logging.info("Starting JITServer with command: {jitServerCmd}".format(jitServerCmd=jitServerCmd))
     myEnv = os.environ.copy()
     # Fork a process and run in background

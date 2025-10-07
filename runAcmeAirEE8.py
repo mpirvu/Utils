@@ -83,12 +83,18 @@ maxUsers                = 199 # Maximum number of simulated AcmeAir users
 #JITServerUsername = "" # To connect to JITServerMachine; leave empty for connecting without ssh
 #JITServerImage   = "liberty-acmeair-ee8:J17"
 #JITServerContainerName = "jitserver"
-JITServerOpts = "" # Extra options for the JITServer process
+JITServerOpts="-XX:+JITServerLogConnections"
+printJITServerOutput = True
+JITServerOutputFile = "/tmp/jitserver.out" # This is where the stdout of the JITServer process is written
+JITServerErrFile = "/tmp/jitserver.err"
+
+
 ############################# END CONFIG ####################################
 
 
 # ENV VARS to use for all runs
 TR_Options=""
+TR_OptionsAOT=""
 
 
 jvmOptions = [
@@ -220,7 +226,7 @@ def computeStats(myList, eliminateOutliers=False):
     else:
         goodValuesList = newList
     avg = statistics.fmean(goodValuesList)
-    stdDev = statistics.stdev(goodValuesList)
+    stdDev = statistics.stdev(goodValuesList) if len(myList) > 1 else 0
     minVal = min(goodValuesList)
     maxVal = max(goodValuesList)
     numSamples = len(goodValuesList)
@@ -399,7 +405,7 @@ def collectJITPerfProfile(javaPID):
 def collectJVMPerfProfile(javaPID):
     perfProcess = None
     outputFile = f"{perfProfileOutput}.{javaPID}"
-    cmd = f"{perfCmd} -o {outputFile} --pid {javaPID} --delay=5000 -- sleep {perfDuration}"
+    cmd = f"{perfCmd} -o {outputFile} --pid {javaPID} --delay=10000 -- sleep {perfDuration}"
     try:
         # Fork a process and run in background
         perfProcess = subprocess.Popen(shlex.split(cmd), universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -467,6 +473,7 @@ def startAppServer(jdk, jvmArgs):
     myEnv["TR_PrintCompTime"] = "1"
     #myEnv["TR_PrintCompStats"] = "1"
     myEnv["TR_Options"] = TR_Options
+    myEnv["TR_OptionsAOT"] = TR_OptionsAOT
     # Fork a process and run in background
     childProcess = subprocess.Popen(shlex.split(appServerStartCmd), env=myEnv, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     logging.debug(f"Waiting for {startupWaitTime} sec for the AppServer to start")
@@ -562,13 +569,25 @@ def startJITServer(jdk):
 
 def stopJITServer(jitServerProcess):
     logging.info("Stopping JITServer...")
+    stdout = ""
+    stderr = ""
     if jitServerProcess.poll() is None: # No return code means the process is still running
         jitServerProcess.terminate()
         try:
-            jitServerProcess.communicate(timeout=15) # Using communicate instead of wait to avoid deadlock
+            stdout, stderr = jitServerProcess.communicate(timeout=15) # Using communicate instead of wait to avoid deadlock
+
         except subprocess.TimeoutExpired:
             logging.info("Stopping JITServer forcefully with sigkill")
             killAppServerIfRunning(jitServerProcess)
+    else: # The JITServer process is not running
+        stdout, stderr = jitServerProcess.communicate(timeout=15)
+    if printJITServerOutput:
+        # Write the stdout string to a file called JITServerOutputFile
+        with open(JITServerOutputFile, "w") as stdoutFile:
+            stdoutFile.write(stdout)
+        # Write the stderr string to a file called JITServerErrFile
+        with open(JITServerErrFile, "w") as stderrFile:
+            stderrFile.write(stderr)
 
 def applyLoad(duration, numClients):
     # Run jmeter remotely

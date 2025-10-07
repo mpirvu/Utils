@@ -771,7 +771,11 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
         clearSCC(jdk, sccDestroyParams)
 
     # Start JITServer if needed
-    jitServerHandle = startJITServer(jdk) if "-XX:+UseJITServer" in javaOpts else None
+    jitServerHandle = None
+    if "-XX:+UseJITServer" in javaOpts:
+        jitServerHandle = startJITServer(jdk)
+        if jitServerHandle == None:
+            sys.exit(-1)
 
     for iter in range(numIter):
         if doOnlyColdRuns:

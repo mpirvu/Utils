@@ -1,6 +1,6 @@
 # Python script to run AcmeAirEE8 app in Liberty
 # Liberty is not run in containers. The script should be run on the same machine as the app server
-# Mongo and JMeter are ran in containers. Both docker and podman should work.
+# Mongo and JMeter are run in containers. Both docker and podman should work.
 
 import datetime # for datetime.datetime.now()
 import logging # https://www.machinelearningplus.com/python/python-logging-guide/
@@ -79,10 +79,6 @@ maxUsers                = 199 # Maximum number of simulated AcmeAir users
 
 ################# JITServer CONFIG ###############
 # JITServer is automatically launched if the JVM option include -XX:+UseJITServer
-#JITServerMachine = "9.42.142.177" # if applicable
-#JITServerUsername = "" # To connect to JITServerMachine; leave empty for connecting without ssh
-#JITServerImage   = "liberty-acmeair-ee8:J17"
-#JITServerContainerName = "jitserver"
 JITServerOpts="-XX:+JITServerLogConnections"
 printJITServerOutput = True
 JITServerOutputFile = "/tmp/jitserver.out" # This is where the stdout of the JITServer process is written
@@ -277,9 +273,9 @@ def startDatabase(dbMachine, dbUsername, startDbScript):
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
     logging.debug(output)
 
-def restoreDatabase(mongoMachine, dbUsername):
+def restoreDatabase(dbMachine, dbUsername):
     remoteCmd = f"{docker} exec {dbContainerName} mongorestore --drop /AcmeAirDBBackup"
-    cmd = f"ssh {dbUsername}@{mongoMachine} \"{remoteCmd}\"" if dbUsername else remoteCmd
+    cmd = f"ssh {dbUsername}@{dbMachine} \"{remoteCmd}\"" if dbUsername else remoteCmd
     logging.debug(f"Restoring database: {cmd}")
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.STDOUT)
     logging.debug(output)
@@ -530,7 +526,7 @@ def getStartupTime(appServerStartTimeMs):
                             endTime = endTime + 3600*1000 # add one hour
                         return float(endTime - appServerStartTimeMs)
                     else:
-                        logging.error("Liberty timestamp is in the wrong format: {timestamp}".format(timestamp=timestamp))
+                        logging.error("AppServer timestamp is in the wrong format: {timestamp}".format(timestamp=timestamp))
                         return math.nan
     except FileNotFoundError:
         logging.error("Cannot find log file: {logFile}".format(logFile=logFile))

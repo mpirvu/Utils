@@ -462,7 +462,8 @@ def killAppServerIfRunning(childProcess):
 
 
 def startAppServer(jdk, jvmArgs):
-    cmd = f"{AppServerAffinity} {jdk}/bin/java {AppServerOpts} {jvmArgs} -jar {applicationName}"
+    appopts = f"{AppServerOpts} -Dquarkus.datasource.jdbc.url=jdbc:postgresql://{dbMachine}:5432/rest-crud"
+    cmd = f"{AppServerAffinity} {jdk}/bin/java {appopts} {jvmArgs} -jar {applicationName}"
     logging.info("Starting AppServer with command: {cmd}".format(cmd=cmd))
     myEnv = os.environ.copy()
     myEnv["JAVA_HOME"] = jdk

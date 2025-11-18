@@ -49,7 +49,7 @@ sccDir  = f"/tmp" # Location of the shared class cache
 sccDestroyParams = f"-Xshareclasses:cacheDir={sccDir},destroyall"
 
 ############### Database configuration #########
-dbMachine          = "localhost"
+dbMachine          = "localhost" # As seen by the AppServer
 dbUsername         = "" # To connect to dbMachine remotely; leave empty to connect without ssh
 dbImage            = "restcrud-db"
 dbContainerName    = "postgres"
@@ -82,7 +82,7 @@ JITServerOpts="-XX:+JITServerLogConnections"
 printJITServerOutput = True
 JITServerOutputFile = "/tmp/jitserver.out" # This is where the stdout of the JITServer process is written
 JITServerErrFile = "/tmp/jitserver.err"
-
+JITServerAffinity = "numactl --physcpubind=0,2,3,4,6,7"
 
 ############################# END CONFIG ####################################
 
@@ -550,7 +550,7 @@ def getCompCPU(childProcess):
 
 
 def startJITServer(jdk):
-    jitServerCmd = f"{jdk}/bin/jitserver {JITServerOpts}"
+    jitServerCmd = f"{JITServerAffinity} {jdk}/bin/jitserver {JITServerOpts}"
     logging.info("Starting JITServer with command: {jitServerCmd}".format(jitServerCmd=jitServerCmd))
     myEnv = os.environ.copy()
     # Fork a process and run in background

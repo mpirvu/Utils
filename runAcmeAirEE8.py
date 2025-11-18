@@ -57,6 +57,7 @@ dbImage            = "localhost/mongo-acmeair-ee8:5.0.15"
 dbContainerName    = "mongodb"
 dbAffinity         = "24-31"
 startDbScript      = f"{docker} run --rm -d --cpuset-cpus={dbAffinity} --name {dbContainerName} --network=host {dbImage} --nojournal"
+dbPort             = 27017
 
 ############### JMeter CONFIG ###############
 jmeterMachine       = "localhost"
@@ -470,6 +471,8 @@ def startAppServer(jdk, jvmArgs):
     #myEnv["TR_PrintCompStats"] = "1"
     myEnv["TR_Options"] = TR_Options
     myEnv["TR_OptionsAOT"] = TR_OptionsAOT
+    myEnv["MONGO_HOST"] = dbMachine
+    myEnv["MONGO_PORT"] = dbPort
     # Fork a process and run in background
     childProcess = subprocess.Popen(shlex.split(appServerStartCmd), env=myEnv, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     logging.debug(f"Waiting for {startupWaitTime} sec for the AppServer to start")

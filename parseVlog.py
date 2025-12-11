@@ -16,6 +16,11 @@ analyzeOnlyStartup = False
 # Exclude the start-up from the analysis
 dontAnalyzeStartup = False
 
+# The following integers control the region of the vlog for which we want to collect stats.
+# Note the analyzeOnlyStartup and dontAnalyzeStartup must be false for these to work.
+startLine = 0 # stats will be kept starting from line
+endLine = -1 # stats after this line will be ignored. -1 means end of the file
+
 # If set to True, the script will print all AOT loads that were not followed by a recompilation
 # as well as all AOT loads that were followed by a recompilation
 printAOTLoadsNotRecompiled = False
@@ -113,8 +118,36 @@ def parseVlog(vlog):
     jvmCpuPattern = re.compile(r'^.+jvmCPU=(\d+)', re.IGNORECASE)
     freeMemPattern = re.compile(r'^.+freePhysicalMemory=(\d+) MB')
     scratchMemPattern = re.compile(r'^.+mem=\[region=(\d+) system=(\d+)\]KB')
+    lineNum = 0
     # Parse the vlog
     for line in vlog:
+        lineNum += 1
+        if startLine > 0 and lineNum == startLine:
+            # reset all compilation stats
+            maxCompLine = "" # Remember the compilation that took the longest
+            maxCompTime = 0
+            maxQSZ = 0
+            numGCRBodies = 0
+            numGCR = 0
+            numSync = 0
+            numDLT = 0
+            numRemote = 0
+            numDeserialized = 0
+            numLocalNonAOTLoad = 0
+            maxJvmCPU = 0
+            minFreeMem = sys.maxsize
+            maxScratchMem = 0
+            maxRegionMem = 0
+            numLowPhysicalMemEvents = 0
+            numRecomp = 0
+            compilationWasDisabled = False
+            numInterpreted = 0 # number of messages "will continue as interpreted"
+            interpretedMethods.clear()
+            compTimes.clear() # List with compilation times
+            compTimesPerLevel.clear() # the key of this hash is the name of the optimization level
+            compBodySizes.clear() # List with sizes of the compiled bodies
+        if endLine != -1 and lineNum > endLine:
+            break
         # #JITSTATE:  t=  6544 VM changed state to NOT_STARTUP
         if "VM changed state to NOT_STARTUP" in line: # start-up point detected
             # Determine the start time
@@ -405,6 +438,8 @@ def parseVlog(vlog):
                     print(info["line"], end='')
 ###################################################
 
+if startLine != 0 or endLine != -1:
+    assert (not analyzeOnlyStartup) and (not dontAnalyzeStartup)
 
 # Get the name of vlog
 if  len(sys.argv) < 2:

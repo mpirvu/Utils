@@ -1,6 +1,10 @@
-# Python script to run AcmeAirEE8 app in Liberty
-# Liberty is not run in containers. The script should be run on the same machine as the app server
-# Mongo and JMeter are run in containers. Both docker and podman should work.
+"""
+Python script to run Adobe Package Manager benchmark
+# Prerequisites
+1. **Python 3.7+** installed on your system
+2. **Playwright** library (pip install playwright)
+3. **Chromium browser library** (playwright install chromium)
+"""
 
 import datetime # for datetime.datetime.now()
 import logging # https://www.machinelearningplus.com/python/python-logging-guide/
@@ -17,7 +21,7 @@ from playwright.sync_api import sync_playwright
 
 
 # Set level to level=logging.DEBUG, level=logging.INFO or level=WARNING reduced level of verbosity
-logging.basicConfig(level=logging.INFO, format='%(asctime)s :: %(levelname)s :: %(message)s',)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s :: %(levelname)s :: %(message)s',)
 
 
 ################### Benchmark configuration #################
@@ -25,9 +29,9 @@ doColdRun          = False # when True we clear the SCC before the first run. Se
 doOnlyColdRuns     = False # when True we run only the cold runs (doColdRun flag is ignored)
 AppServerHost      = "localhost" # the host where the app server is running from the point of view of the JMeter machine
 AppServerPort      = 9080
-AppServerLocation  = "/opt/IBM/OL-23.0.0.3/liberty"
+AppServerLocation  = "/team/mpirvu/JackRabbit/wlp"
 applicationName    = "defaultServer"
-AppServerAffinity  = "numactl --physcpubind=2-3 --membind=0"
+AppServerAffinity  = "numactl --physcpubind=0-7 --membind=0"
 applicationLocation= f"{AppServerLocation}/usr/servers/{applicationName}"
 logFile            = f"{applicationLocation}/logs/messages.log"
 appServerStartCmd  = f"{AppServerAffinity} {AppServerLocation}/bin/server run {applicationName}"
@@ -35,8 +39,8 @@ appServerStopCmd   = f"{AppServerLocation}/bin/server stop {applicationName}"
 startupWaitTime    = 180 # seconds to wait before checking to see if AppServer is up
 URL = f"http://{AppServerHost}:{AppServerPort}/crx/packmgr/index.jsp"
 USERNAME = "admin"
-PASSWORD = "admin"
-PACKAGE_PATH = r"C:\Users\MariusPirvu\Downloads\sample_package_performance.zip" # Package to install
+PASSWD = "admin"
+PACKAGE_PATH = r"/team/mpirvu/JackRabbit/sample_package_performance.zip" # Package to install
 # Debug options
 ENABLE_SCREENSHOTS = False  # Set to False to disable all screenshots
 
@@ -53,16 +57,13 @@ perfDuration = 300 # seconds
 
 
 ############### SCC configuration ###########################
-sccDir  = f"{AppServerLocation}/usr/servers/.classCache" # Location of the shared class cache
+sccDir  = f"/tmp" # Location of the shared class cache
 sccDestroyParams = f"-Xshareclasses:cacheDir={sccDir},destroyall"
 
 
 ################ Load CONFIG ###############
 numRepetitionsOneClient = 0
 numRepetitions50Clients = 2
-durationOfOneClient     = 60 # seconds
-durationOfOneRepetition = 300 # seconds
-numClients              = 10
 delayBetweenRepetitions = 10
 numMeasurementTrials    = 1 # Last N trials are used in computation of throughput
 
@@ -70,7 +71,7 @@ numMeasurementTrials    = 1 # Last N trials are used in computation of throughpu
 ################# JITServer CONFIG ###############
 # JITServer is automatically launched if the JVM option include -XX:+UseJITServer
 JITServerOpts="-XX:+JITServerLogConnections"
-printJITServerOutput = True
+printJITServerOutput = False
 JITServerOutputFile = "/tmp/jitserver.out" # This is where the stdout of the JITServer process is written
 JITServerErrFile = "/tmp/jitserver.err"
 
@@ -84,11 +85,16 @@ TR_OptionsAOT=""
 
 
 jvmOptions = [
-        "-Xmx256m"
+        #f"-Xmx3G -Xms3G",
+        f"-Xmx3G -Xms3G -Xshareclasses:none",
+        #f"-Xmx3G -Xms3G -Xshareclasses:none -Xjit:dontDowngradeToCold",
+        #f"-Xmx3G -Xms3G -Xshareclasses:none -Xjit:dontDowngradeToCold,disableSelectiveNoServer",
+        #f"-Xmx3G -Xms3G -Xshareclasses:none -Xjit:disableDynamicLoopTransfer,disableInlinerFanIn,dontDowngradeToCold,disableSelectiveNoServer",
+        #f"-Xmx3G -Xms3G -Xshareclasses:none -Xtune:throughput",
 ]
 
 jdks = [
-    "/home/mpirvu/FullJava17/openj9-openjdk-jdk17/build/linux-x86_64-server-release/images/jdk",
+    "/team/mpirvu/sdks/OpenJ9-JDK17-x86-64_linux-20251129-000857",
 ]
 
 def count_not_nan(myList):
@@ -413,8 +419,7 @@ def startAppServer(jdk, jvmArgs):
     #myEnv["TR_PrintCompStats"] = "1"
     myEnv["TR_Options"] = TR_Options
     myEnv["TR_OptionsAOT"] = TR_OptionsAOT
-    myEnv["MONGO_HOST"] = dbMachine
-    myEnv["MONGO_PORT"] = dbPort
+
     # Fork a process and run in background
     childProcess = subprocess.Popen(shlex.split(appServerStartCmd), env=myEnv, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     logging.debug(f"Waiting for {startupWaitTime} sec for the AppServer to start")
@@ -448,7 +453,14 @@ def stopAppServer(childProcess):
     else:
         logging.error("AppServer is not running")
     killAppServerIfRunning(childProcess)
-
+    # Delete the log files
+    cmd = f"rm -rf {AppServerLocation}/usr/servers/{applicationName}/crx-quickstart"
+    logging.info("Deleting crx-quickstart files: {cmd}".format(cmd=cmd))
+    try:
+        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.STDOUT)
+        logging.info(f"Successfully deleted crx-quickstart files")
+    except subprocess.CalledProcessError as e:
+        logging.warning(f"Failed to delete crx-quickstart files (exit code {e.returncode}): {e.output}")
 '''
 Extract the start-up timestamp from logFile and compute start-up time of AppServer.
 Parameters: appServerStartTimeMs - time in ms when AppServer was started (only minutes, seconds and millisec are used)
@@ -612,7 +624,7 @@ def automate_aem_package_workflow_debug():
             if page.locator('input[name="j_username"]').count() > 0:
                 print("Login form found!")
                 page.fill('input[name="j_username"]', USERNAME)
-                page.fill('input[name="j_password"]', PASSWORD)
+                page.fill('input[name="j_password"]', PASSWD)
                 if ENABLE_SCREENSHOTS:
                     page.screenshot(path='debug_step3_before_login.png')
                     print("✓ Screenshot saved: debug_step3_before_login.png")
@@ -1042,10 +1054,10 @@ def automate_aem_package_workflow_debug():
             context.close()
             browser.close()
             print("Browser closed.")
-    return installation_time
+    return int(installation_time)
 
 
-def runPhase(duration, numClients):
+def runPhase():
     logging.debug("Sleeping for {n} sec before next phase".format(n=delayBetweenRepetitions))
     time.sleep(delayBetweenRepetitions)
     installationTime = automate_aem_package_workflow_debug()
@@ -1078,13 +1090,6 @@ def runBenchmarkOnce(jdk, jvmArgs, doMemAnalysis):
             logging.error("Failed to start JIT perf profiling because Java process has terminated")
 
     for pulse in range(maxPulses):
-        # Determine run characteristics
-        if pulse >= numRepetitionsOneClient:
-            cli = numClients
-            duration = durationOfOneRepetition
-        else:
-            cli = 1
-            duration = durationOfOneClient
         # If enabled, start the JVM profiling thread in the background
         if collectPerfProfileForJVM and pulse == maxPulses-1:
             if childProcess.poll() is None: # Still running:
@@ -1092,7 +1097,7 @@ def runBenchmarkOnce(jdk, jvmArgs, doMemAnalysis):
             else:
                 logging.error("Failed to start JVM perf profiling because Java process has terminated")
 
-        thrResults[pulse] = runPhase(duration, cli)
+        thrResults[pulse] = runPhase()
         logging.info("InstTime={thr}".format(thr=thrResults[pulse]))
 
     # Collect RSS at end of run
@@ -1142,8 +1147,8 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
             javaOpts = javaOpts + extraArgsForMemAnalysis
         thrList, rss, peakRss, cpu, startupTime = runBenchmarkOnce(jdk, javaOpts, doMemAnalysis)
         lastThr = meanLastValues(thrList, numMeasurementTrials) # average for last N pulses
-        print(f"Run {iter}: Thr={lastThr:6.1f} RSS={rss:6.1f} MB  PeakRSS={peakRss:6.1f} MB  CPU={cpu:4.1f} sec  Startup={startupTime:5.0f} PeakThr={peakThr:6.1f}".
-              format(lastThr=lastThr, rss=rss, peakRss=peakRss, cpu=cpu, startupTime=startupTime, peakThr=peakThr), flush=True)
+        print(f"Run {iter}: Thr={lastThr:6.1f} RSS={rss:6.1f} MB  PeakRSS={peakRss:6.1f} MB  CPU={cpu:4.1f} sec  Startup={startupTime:5.0f}".
+              format(lastThr=lastThr, rss=rss, peakRss=peakRss, cpu=cpu, startupTime=startupTime), flush=True)
         thrResults.append(thrList) # copy all the pulses
         rssResults.append(rss)
         cpuResults.append(cpu)

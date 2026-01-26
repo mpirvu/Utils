@@ -33,6 +33,7 @@ logFile            = f"{applicationLocation}/logs/messages.log"
 appServerStartCmd  = f"{AppServerAffinity} {AppServerLocation}/bin/server run {applicationName}"
 appServerStopCmd   = f"{AppServerLocation}/bin/server stop {applicationName}"
 startupWaitTime    = 30 # seconds to wait before checking to see if AppServer is up
+printAppServerStderr = True
 
 memAnalysis = False # Collect javacores and smaps for memory analysis
 dirForMemAnalysisFiles = "/tmp"
@@ -43,7 +44,7 @@ collectPerfProfileForJIT = False # Collect perf profile of the "main" compilatio
 collectPerfProfileForJVM = False  # Collect perf profile for the entire JVM
 perfProfileOutput = "/tmp/perf.data"
 perfCmd= f"perf record -e cycles -c 200000"
-perfDuration = 300 # seconds
+perfDuration = 180 # seconds
 
 
 ############### SCC configuration ###########################
@@ -65,7 +66,7 @@ jmeterUsername      = "" # To connect to JMeter machine; leave empty to connect 
 jmeterImage         = "localhost/jmeter-acmeair:5.3"
 jmeterContainerName = "jmeter"
 jmeterAffinity      = "16-19"
-printRampup         =  False # If True, print all JMeter throughput values to plot rampup curve
+printRampup         = False # If True, print all JMeter throughput values to plot rampup curve
 
 ################ Load CONFIG ###############
 numRepetitionsOneClient = 0
@@ -471,6 +472,8 @@ def startAppServer(jdk, jvmArgs):
     #myEnv["TR_PrintCompStats"] = "1"
     myEnv["TR_Options"] = TR_Options
     myEnv["TR_OptionsAOT"] = TR_OptionsAOT
+    myEnv["TR_PrintJITServerMsgStats"] = "1"
+    myEnv["TR_PrintJITServerAOTCacheStats"] = "1"
     myEnv["MONGO_HOST"] = dbMachine
     myEnv["MONGO_PORT"] = dbPort
     # Fork a process and run in background
@@ -545,7 +548,8 @@ def getCompCPU(childProcess):
     threadTime = 0.0
     compTimePattern = re.compile("^Time spent in compilation thread =(\d+) ms")
     for line in lines:
-        #print(line)
+        if printAppServerStderr:
+           print(line)
         m = compTimePattern.match(line)
         if m:
             threadTime += float(m.group(1))

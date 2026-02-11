@@ -62,6 +62,9 @@ knownOptLevels = {
 def printHeaderStats():
     print("OptLvl\tSamples\tTOTAL(ms)\tMIN(usec)\tAVG(usec)\tMAX(ms)")
 
+def printMemHeaderStats():
+    print("OptLvl\tSamples\tMIN(KB)\tAVG(KB)\tMAX(KB)")
+
 def printBodySizeHeaderStats():
     print("    \tSamples\tTOTAL(KB)\t     MIN\t     AVG\tMAX(KB)")
 
@@ -73,6 +76,13 @@ def printStats(name, dataList):
     maxValue = max(dataList)/1000
     print("{name}\t{n:7d}\t{s:8.0f}\t{min:8.0f}\t{avg:8.0f}\t{max:6.1f}".format(name=name, n=numSamples, s=sumValue/1000, min=minValue, avg=meanValue, max=maxValue))
 
+def printMemStats(name, dataList):
+    numSamples = len(dataList)
+    sumValue = sum(t[1] for t in dataList)
+    meanValue = sumValue/numSamples
+    minValue = min(t[1] for t in dataList)
+    maxValue = max(t[1] for t in dataList)
+    print("{name}\t{n:7d}\t{min:7.0f}\t{avg:7.0f}\t{max:7.0f}".format(name=name, n=numSamples, min=minValue, avg=meanValue, max=maxValue))
 
 def parseVlog(vlog):
     maxCompLine = "" # Remember the compilation that took the longest
@@ -96,6 +106,7 @@ def parseVlog(vlog):
     interpretedMethods = set() # set of methods that will continue as interpreted
     compTimes = [] # List with compilation times
     compTimesPerLevel = {} # the key of this hash is the name of the optimization level
+    memPerLevel = {} # the key of this hash is the name of the optimization level, and value is a list of (regionMem, systemMem) tuples
     compBodySizes = [] # List with sizes of the compiled bodies
     failureHash = {}
     failedMethods = set() # set for tracking whether methods remain interpreted after a failure
@@ -145,6 +156,7 @@ def parseVlog(vlog):
             interpretedMethods.clear()
             compTimes.clear() # List with compilation times
             compTimesPerLevel.clear() # the key of this hash is the name of the optimization level
+            memPerLevel.clear()
             compBodySizes.clear() # List with sizes of the compiled bodies
         if endLine != -1 and lineNum > endLine:
             break
@@ -179,6 +191,7 @@ def parseVlog(vlog):
                 interpretedMethods.clear()
                 compTimes.clear() # List with compilation times
                 compTimesPerLevel.clear() # the key of this hash is the name of the optimization level
+                memPerLevel.clear()
                 compBodySizes.clear() # List with sizes of the compiled bodies
                 continue
         m = compEndPattern.match(line)
@@ -211,6 +224,18 @@ def parseVlog(vlog):
                 compTimesPerLevel[levelName].append(usec)
             else:
                 compTimesPerLevel[levelName] = [usec]
+
+            # Track heap memory consumed by compilations: mem=[region=704 system=2048]KB
+            m = re.search(r"mem=\[region=(\d+)\s+system=(\d+)\]KB", line)
+            if m:
+                regionMem = int(m.group(1))
+                systemMem = int(m.group(2))
+                maxRegionMem = max(maxRegionMem, regionMem)
+                maxScratchMem = max(maxScratchMem, systemMem)
+                if levelName in memPerLevel:
+                    memPerLevel[levelName].append((regionMem, systemMem))
+                else:
+                    memPerLevel[levelName] = [(regionMem, systemMem)]
 
             bodySize = methodEndAddr - methodStartAddr
             if bodySize > 0:
@@ -360,7 +385,15 @@ def parseVlog(vlog):
 
     print("\nMAXLINE:", maxCompLine)
 
-    print("Stats regarding compiled body sizes")
+    print("\nStats for system memory used per opt level:")
+    printMemHeaderStats()
+    for opt in knownOptLevels.keys():
+        levelName = knownOptLevels[opt]
+        valueList = memPerLevel.get(levelName, [])
+        if valueList: # if not empty
+            printMemStats(levelName, valueList)
+
+    print("\nStats regarding compiled body sizes")
     printBodySizeHeaderStats()
     printStats("All", compBodySizes)
     print("")

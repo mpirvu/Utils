@@ -1,0 +1,729 @@
+# Python script to start and stop Liberty containers and collect
+# statistics about startup time, footprint and CompCPU
+# If command line arguments indicates that the JVM is running in client mode,
+# a JITServer will be launched automatically
+from collections import deque
+import datetime # for datetime.datetime.now()
+import logging # https://www.machinelearningplus.com/python/python-logging-guide/
+import math
+import queue
+import re # for regular expressions
+import shlex, subprocess
+import sys # for exit
+import time # for sleep
+import os # for env vars
+
+############################### CONFIG ###############################################
+#level=logging.DEBUG, logging.INFO, logging.WARNING
+logging.basicConfig(level=logging.INFO, format='%(asctime)s :: %(levelname)s :: (%(threadName)-6s) :: %(message)s',)
+
+docker = "podman" # Select between docker and podman
+netOpts = "--network=slirp4netns" if docker == "podman" else "" # for podman we need to use slirp4netns if running as root. This will be added to Liberty.
+
+################### Benchmark configuration #################
+doColdRun = False
+appServerMachine = "9.46.116.36"
+username = "" # for connecting remotely to the SUT; leave empty to connect without ssh
+containerName = "liberty"
+appServerPort   = "9080"
+cpuLimit        = "--cpuset-cpus=0-4 --cpus=4" # This can also be used to specify CPU affinity if so desired
+memLimit        = "-m=512m"
+delayToStart    = 15 # seconds; waiting for the AppServer to start before checking for valid startup
+extraDockerOpts = "" # extra options to pass to docker run
+instantOnRestore= False # Set to true to add --cap-add=CHECKPOINT_RESTORE to docker run command
+postRestoreOpts = "-XX:-UseJITServer -XX:+JITServerLogConnections" if instantOnRestore else "" # Options to add to the JVM for restore
+getFirstResponseTime = False # Set to true to get the first response time
+firstResponseHelperScript = "./loop_curl.sh" # Script to get the first response time
+
+############### SCC configuration #####################
+useSCCVolume    = False  # set to true to have a SCC mounted in a volume (instead of the embedded SCC)
+SCCVolumeName   = "scc_volume" # Name of the volume to use for the SCC
+sccInstanceDir  = "/opt/java/.scc" # Location of the shared class cache in the instance
+mountOpts       = f"--mount type=volume,src={SCCVolumeName},target={sccInstanceDir}" if useSCCVolume  else ""
+
+################# JITServer CONFIG ###############
+# JITServer is automatically launched if the JVM option include -XX:+UseJITServer
+JITServerMachine       = "9.46.116.36" # if applicable
+JITServerUsername      = "" # To connect to JITServerMachine; leave empty for connecting without ssh
+JITServerImage         = "" # leave empty to use the Liberty image as JITServer
+JITServerAffinity      = "--cpuset-cpus 8,9,10,11,20,21,22,23"
+JITServerContainerName = "jitserver"
+JITServerOptions       = "-XX:+JITServerLogConnections -XX:+JITServerUseAOTCache -Xdump:directory=/tmp/vlogs" # Options to pass to the JITServer
+JITServerExtraOptions  = "-v /tmp/vlogs:/tmp/vlogs"
+JITServerUseEncryption = False
+KeyAndCertificateDir   = "/home/mpirvu/secrets" # Only used if JITServerUseEncryption = True
+SecretsDirInContainer  = "/tmp/secrets" # Only used if JITServerUseEncryption = True
+
+
+memAnalysis = False # Collect javacores and smaps for memory analysis
+dirForMemAnalysisFiles = "/tmp/vlogs" # This is where the javacore will appear inside the container
+# This will only work if the JVM runs locally on the same machine where the script is run
+# The directory below must exist and have proper write permissions
+localDirForMemAnalysisFiles = "/tmp/vlogs" # This is where the javacore will be copied to on the host
+extraArgsForMemAnalysis = f" -Dcom.ibm.dbgmalloc=true -Xdump:none -Xdump:system:events=user,file={dirForMemAnalysisFiles}/core.%pid.%seq.dmp -Xdump:java:events=user,file={dirForMemAnalysisFiles}/javacore.%pid.%seq.txt "
+
+# List of configs to run
+# Each entry is a dictionary with "image" and "args" as keys
+configs = [
+    {"image":"localhost/db10:J25-gchint", "args":"-Xmx256m"},
+#    {"image":"", "args":""},
+]
+
+def nancount(myList):
+    count = 0
+    for i in range(len(myList)):
+        if not math.isnan(myList[i]):
+            count += 1
+    return count
+
+def nanmean(myList):
+    total = 0
+    numValidElems = 0
+    for i in range(len(myList)):
+        if not math.isnan(myList[i]):
+            total += myList[i]
+            numValidElems += 1
+    return total/numValidElems if numValidElems > 0 else math.nan
+
+def nanstd(myList):
+    total = 0
+    numValidElems = 0
+    for i in range(len(myList)):
+        if not math.isnan(myList[i]):
+            total += myList[i]
+            numValidElems += 1
+
+    if numValidElems == 0:
+        return math.nan
+    if numValidElems == 1:
+        return 0
+    else:
+        mean = total/numValidElems
+        total = 0
+        for i in range(len(myList)):
+            if not math.isnan(myList[i]):
+                total += (myList[i] - mean)**2
+        return math.sqrt(total/(numValidElems-1))
+
+def nanmin(myList):
+    min = math.inf
+    for i in range(len(myList)):
+        if not math.isnan(myList[i]) and myList[i] < min:
+            min = myList[i]
+    return min
+
+def nanmax(myList):
+    max = -math.inf
+    for i in range(len(myList)):
+        if not math.isnan(myList[i]) and myList[i] > max:
+            max = myList[i]
+    return max
+
+def tDistributionValue95(degreeOfFreedom):
+    if degreeOfFreedom < 1:
+        return math.nan
+        #import scipy.stats as stats
+        #  stats.t.ppf(0.975, degreesOfFreedom))
+    tValues = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+               2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+               2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,]
+    if degreeOfFreedom <= 30:
+        return tValues[degreeOfFreedom-1]
+    else:
+        if degreeOfFreedom <= 60:
+            return 2.042 - 0.001 * (degreeOfFreedom - 30)
+        else:
+            return 1.96
+
+# Confidence intervals tutorial
+# mean +- t * std / sqrt(n)
+# For 95% confidence interval, t = 1.96 if we have many samples
+def meanConfidenceInterval95(myList):
+    cnt = nancount(myList)
+    if cnt <= 1:
+        return math.nan
+    tvalue = tDistributionValue95(cnt-1)
+    avg, stdDev = nanmean(myList), nanstd(myList)
+    marginOfError = tvalue * stdDev / math.sqrt(cnt)
+    return 100.0*marginOfError/avg
+
+def computeStats(myList):
+    avg = nanmean(myList)
+    stdDev = nanstd(myList)
+    min = nanmin(myList)
+    max = nanmax(myList)
+    ci95 = meanConfidenceInterval95(myList)
+    samples = nancount(myList)
+    return avg, stdDev, min, max, ci95, samples
+
+def printStats(myList, name):
+    avg, stdDev, min, max, ci95, samples = computeStats(myList)
+    print("{name:<17} Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:7.1f} CI95={ci95:7.1f}%  samples={n}".
+            format(name=name, avg=avg, stdDev=stdDev, min=min, max=max, maxmin=max/min, ci95=ci95, n=samples))
+
+def meanLastValues(myList, numLastValues):
+    assert numLastValues > 0
+    if numLastValues > len(myList):
+        numLastValues = len(myList)
+    return nanmean(myList[-numLastValues:])
+
+def getMainPIDFromContainer(host, username, instanceID):
+    remoteCmd = f"{docker} inspect " + "--format='{{.State.Pid}}' " + instanceID
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    try:
+        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+        lines = output.splitlines()
+        return lines[0]
+    except:
+        return 0
+    return 0
+
+# Given a container ID, find all the Java processes running in it
+# If there is only one Java process, return its PID
+def getJavaPIDFromContainer(host, username, instanceID):
+    mainPID = getMainPIDFromContainer(host, username, instanceID)
+    if mainPID == 0:
+        return 0 # Error
+    logging.debug("Main PID from container is {mainPID}".format(mainPID=mainPID))
+    # Find all PIDs running on host
+    remoteCmd = "ps -eo ppid,pid,cmd --no-headers"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    pattern = re.compile("^\s*(\d+)\s+(\d+)\s+(\S+)")
+    # Construct a dictionary with key=PPID and value a list of PIDs (for its children)
+    ppid2pid = {}
+    pid2cmd = {}
+    for line in lines:
+        m = pattern.match(line)
+        if m:
+            ppid = m.group(1)
+            pid = m.group(2)
+            cmd = m.group(3)
+            if ppid in ppid2pid:
+                ppid2pid[ppid].append(pid)
+            else:
+                ppid2pid[ppid] = [pid]
+            pid2cmd[pid] = cmd
+    # Do a breadth-first search to find all Java processes. Use a queue.
+    javaPIDs = []
+    pidQueue = queue.Queue()
+    pidQueue.put(mainPID)
+    while not pidQueue.empty():
+        pid = pidQueue.get()
+        # If this PID is a Java process, add it to the list
+        if "/java" in pid2cmd[pid]:
+            javaPIDs.append(pid)
+        if pid in ppid2pid: # If my PID has children
+            for childPID in ppid2pid[pid]:
+                pidQueue.put(childPID)
+    if len(javaPIDs) == 0:
+        logging.error("Could not find any Java process in container {instanceID}".format(instanceID=instanceID))
+        return 0
+    if len(javaPIDs) > 1:
+        logging.error("Found more than one Java process in container {instanceID}".format(instanceID=instanceID))
+        return 0
+    return int(javaPIDs[0])
+
+# Given a container ID, find all the Java processes running in it
+# If there is only one Java process, return its PID
+def getJavaPIDFromContainer(host, username, instanceID):
+    mainPID = getMainPIDFromContainer(host, username, instanceID)
+    if mainPID == 0:
+        return 0 # Error
+    logging.debug("Main PID from container is {mainPID}".format(mainPID=mainPID))
+    # Find all PIDs running on host
+    remoteCmd = "ps -eo ppid,pid,cmd --no-headers"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    pattern = re.compile("^\s*(\d+)\s+(\d+)\s+(\S+)")
+    # Construct a dictionary with key=PPID and value a list of PIDs (for its children)
+    ppid2pid = {}
+    pid2cmd = {}
+    for line in lines:
+        m = pattern.match(line)
+        if m:
+            ppid = m.group(1)
+            pid = m.group(2)
+            cmd = m.group(3)
+            if ppid in ppid2pid:
+                ppid2pid[ppid].append(pid)
+            else:
+                ppid2pid[ppid] = [pid]
+            pid2cmd[pid] = cmd
+    # Do a breadth-first search to find all Java processes. Use a queue.
+    javaPIDs = []
+    pidQueue = queue.Queue()
+    pidQueue.put(mainPID)
+    while not pidQueue.empty():
+        pid = pidQueue.get()
+        # If this PID is a Java process, add it to the list
+        if "/java" in pid2cmd[pid]:
+            javaPIDs.append(pid)
+        if pid in ppid2pid: # If my PID has children
+            for childPID in ppid2pid[pid]:
+                pidQueue.put(childPID)
+    if len(javaPIDs) == 0:
+        logging.error("Could not find any Java process in container {instanceID}".format(instanceID=instanceID))
+        return 0
+    if len(javaPIDs) > 1:
+        logging.error("Found more than one Java process in container {instanceID}".format(instanceID=instanceID))
+        return 0
+    return int(javaPIDs[0])
+
+def removeForceContainer(host, username, instanceName):
+    remoteCmd = f"{docker} rm -f {instanceName}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    logging.debug("Removing container instance {instanceName}: {cmd}".format(instanceName=instanceName,cmd=cmd))
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+
+def stopContainersFromImage(host, username, imageName):
+    # Find all running containers from image
+    remoteCmd = f"{docker} ps --quiet --filter ancestor={imageName}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    for containerID in lines:
+        remoteCmd = f"{docker} stop {containerID}"
+        cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+        logging.debug(f"Stopping container: {cmd}")
+        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+
+def stopAppServerByID(host, username, containerID):
+    logging.debug("Stopping AppServer container {containerID}".format(containerID=containerID))
+    # Check that the container is still running
+    remoteCmd = f"{docker} ps --quiet --filter id={containerID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    if not lines:
+        logging.warning("AppServer instance {containerID} does not exist. Might have crashed".format(containerID=containerID))
+        return False
+    remoteCmd = f"{docker} stop {containerID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    return True
+
+def removeContainersFromImage(host, username, imageName):
+    # First stop running containers
+    stopContainersFromImage(host, username, imageName)
+    # Now remove stopped containes
+    remoteCmd = f"{docker} ps -a --quiet --filter ancestor={imageName}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    for containerID in lines:
+        remoteCmd = f"{docker} rm {containerID}"
+        cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+        logging.debug(f"Removing container: {cmd}")
+        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+
+def collectJavacore(javaPID):
+    # Produce javacore file
+    cmd = f"kill -3 {javaPID}" # Send SIGQUIT to the Java process
+    logging.info("Generating javacore by sending SIGQUIT with {cmd}".format(cmd=cmd))
+    subprocess.run(shlex.split(cmd), universal_newlines=True)
+    logging.info("Sleeping for 60 seconds to produce the coredump and javacore...")
+    time.sleep(60)
+
+def collectSmaps(javaPID):
+    # Get smaps file
+    cmd = f"cp /proc/{javaPID}/smaps {dirForMemAnalysisFiles}/smaps.{javaPID}"
+    try:
+        subprocess.run(shlex.split(cmd), universal_newlines=True)
+    except:
+        logging.error("Cannot get smaps file for javaPID {javaPID}".format(javaPID=javaPID))
+
+def collectJavacoreAndSmaps(javaPID):
+    collectSmaps(javaPID)
+    collectJavacore(javaPID)
+
+# Given a PID, return RSS and peakRSS in MB for the process
+def getRss(host, username, pid):
+    _scale = {'kB': 1024, 'mB': 1024*1024, 'KB': 1024, 'MB': 1024*1024}
+    # get pseudo file  /proc/<pid>/status
+    filename = "/proc/" + str(pid) + "/status"
+    remoteCmd = f"cat {filename}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    try:
+        s = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+        #lines = s.splitlines()
+    except IOError as ioe:
+        logging.warning("Cannot open {filename}: {msg}".format(filename=filename,msg=str(ioe)))
+        return [math.nan, math.nan]  # wrong pid?
+    i =  s.index("VmRSS:") # Find the position of the substring
+    # Take everything from this position till the very end
+    # Then split the string 3 times, taking first 3 "words" and putting them into a list
+    tokens = s[i:].split(None, 3)
+    if len(tokens) < 3:
+        return [math.nan, math.nan]  # invalid format
+    rss = float(tokens[1]) * _scale[tokens[2]] / 1048576.0 # convert value to bytes and then to MB
+
+    # repeat for peak RSS
+    i =  s.index("VmHWM:")
+    tokens = s[i:].split(None, 3)
+    if len(tokens) < 3:
+        return [math.nan, math.nan]  # invalid format
+    peakRss = float(tokens[1]) * _scale[tokens[2]] / 1048576.0 # convert value to bytes and then to MB
+    return [rss, peakRss]
+
+def clearSCC(host, username):
+    logging.info("Clearing SCC")
+    remoteCmd = f"{docker} volume rm --force {SCCVolumeName}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.run(shlex.split(cmd), universal_newlines=True, stderr=subprocess.DEVNULL)
+    # TODO: make sure volume does not exist
+
+def verifyAppServerInContainerIDStarted(instanceID, host, username):
+    remoteCmd = f"{docker} ps --quiet --filter id={instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    if not lines:
+        logging.warning("Liberty container {instanceID} is not running").format(instanceID=instanceID)
+        return False
+
+    remoteCmd = f"{docker} logs --tail=100 {instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    errPattern = re.compile('.+\[ERROR')
+    readyPattern = re.compile(".+is ready to run a smarter planet")
+    for iter in range(15):
+        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+        liblines = output.splitlines()
+        for line in liblines:
+            m = errPattern.match(line)
+            if m:
+                logging.warning("Liberty container {instanceID} errored while starting: {line}").format(instanceID=instanceID,line=line)
+                return False
+            m1 = readyPattern.match(line)
+            if m1:
+                if logging.root.level <= logging.DEBUG:
+                   print(lines)
+                return True # True means success
+        time.sleep(1) # wait 1 sec and try again
+        logging.warning("Checking again")
+    return False
+
+def startAppServerContainer(host, username, instanceName, image, port, cpus, mem, jvmArgs, mountOpts, doMemAnalysis):
+    # vlogs can be created in /tmp/vlogs -v /tmp/vlogs:/tmp/vlogs
+    #JITOPTS = "\"verbose={compilePerformance},verbose={JITServer}\""
+    JITOPTS = ""
+    # If using JITServer post restore, add its address to the JVM options
+    instantONOpts = ""
+    otherOpts = ""
+    if instantOnRestore:
+        restoreOpts = postRestoreOpts
+        if ("-XX:+UseJITServer" in postRestoreOpts):
+            restoreOpts = restoreOpts + f" -XX:JITServerAddress={JITServerMachine} "
+            if JITServerUseEncryption:
+                restoreOpts = restoreOpts + f" -XX:JITServerSSLRootCerts={SecretsDirInContainer}/cert.pem "
+                otherOpts = f"--mount type=bind,source={KeyAndCertificateDir},destination={SecretsDirInContainer}"
+        if doMemAnalysis:
+            restoreOpts = restoreOpts + extraArgsForMemAnalysis
+        instantONOpts = f"-e OPENJ9_RESTORE_JAVA_OPTIONS='{restoreOpts}' --cap-add=CHECKPOINT_RESTORE --security-opt seccomp=unconfined"
+    else:
+        if ("-XX:+UseJITServer" in jvmArgs):
+            jvmArgs = jvmArgs + f" -XX:JITServerAddress={JITServerMachine} "
+            if JITServerUseEncryption:
+                jvmArgs = jvmArgs + f" -XX:JITServerSSLRootCerts={SecretsDirInContainer}/cert.pem "
+                otherOpts = f"--mount type=bind,source={KeyAndCertificateDir},destination={SecretsDirInContainer}"
+
+    # If we want to do memory analysis we need to collect the javacores from the container
+    # Mount a directory from the machine into the container
+    if doMemAnalysis:
+        otherOpts = otherOpts + f" -v {localDirForMemAnalysisFiles}:{dirForMemAnalysisFiles} "
+
+    remoteCmd = f"{docker} run -d {extraDockerOpts} {cpuLimit} {memLimit} {mountOpts} {instantONOpts} {netOpts} {otherOpts} -e TR_Options={JITOPTS} -e JVM_ARGS='{jvmArgs}' -e TR_PrintJITServerMsgStats=1 -e TR_PrintJITServerAOTCacheStats=1 -e TR_PrintCompStats=1 -e TR_PrintCompTime=1 -p {port}:9080 --name {instanceName} {image}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    logging.debug("Starting liberty instance {instanceName}: {cmd}".format(instanceName=instanceName,cmd=cmd))
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    assert lines, "Error: docker run output is empty".format(l=lines)
+    assert len(lines) == 1, f"Error: docker run output containes several lines: {lines}"
+    if logging.root.level <= logging.DEBUG:
+        print(lines)
+    instanceID = lines[0] # ['2ccae49f3c03af57da27f5990af54df8a81c7ce7f7aace9a834e4c3dddbca97e']
+    time.sleep(delayToStart)
+    started = verifyAppServerInContainerIDStarted(instanceID, host, username)
+    if not started:
+        logging.error(f"Liberty instance {instanceName} from {image} cannot start in the alloted time")
+        removeForceContainer(host=host, username=username, instanceName=instanceName)
+        return None
+    return instanceID
+
+def checkAppServerForErrors(instanceID, host, username):
+    remoteCmd = f"{docker} ps --quiet --filter id={instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    if not lines:
+        logging.warning("AppServer container {instanceID} is not running").format(instanceID=instanceID)
+        return False
+
+    remoteCmd = f"{docker} logs --tail=200 {instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    errPattern = re.compile('^.+ERROR')
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.STDOUT)
+    liblines = output.splitlines()
+    for line in liblines:
+        if errPattern.match(line):
+            logging.error("AppServer errored: {line}".format(line=line))
+            return False
+    return True
+
+def getCompCPUFromContainer(host, username, instanceID):
+    logging.debug("Computing CompCPU for Liberty instance {instanceID}".format(instanceID=instanceID))
+    # Check that the indicated container still exists
+    remoteCmd = f"{docker} ps -a --quiet --filter id={instanceID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    if not lines:
+        logging.warning("Liberty instance {instanceID} does not exist.".format(instanceID=instanceID))
+        return math.nan
+
+    threadTime = 0.0
+    remoteCmd = f"{docker} logs --tail=200 {instanceID}" # I need to capture stderr as well
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.STDOUT)
+    liblines = output.splitlines()
+    compTimePattern = re.compile("^Time spent in compilation thread =(\d+) ms")
+    for line in liblines:
+        m = compTimePattern.match(line)
+        if m:
+            threadTime += float(m.group(1))
+    return threadTime if threadTime > 0 else math.nan
+
+def getAppServerStartupTime(host, username, containerID, containerStartTimeMs, curlProcess):
+    logging.debug("Computing startup time for Liberty instance {instanceID}".format(instanceID=containerID))
+    startupTime = math.nan
+    firstResponseTime = math.nan
+    # Check that the indicated container still exists
+    remoteCmd = f"{docker} ps -a --quiet --filter id={containerID}"
+    cmd = f"ssh {username}@{host} \"{remoteCmd}\"" if username else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    if not lines:
+        logging.warning("Liberty instance {instanceID} does not exist.".format(instanceID=containerID))
+        return startupTime, firstResponseTime
+    # Copy the log file from the container to the host
+    # Weird thing that I cannot use /tmp to store the log file
+    logFileOnHost = f"messages.log.{containerID}"
+    localLogFile = logFileOnHost + ".local"
+    if username:
+        remoteCmd = f"{docker} cp {containerID}:/logs/messages.log {logFileOnHost}"
+        cmd = f"ssh {username}@{host} \"{remoteCmd}\""
+        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+        # Copy the log file from the remote host to the local machine
+        cmd = f"scp {username}@{host}:{logFileOnHost} {localLogFile}"
+        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    else: # Running locally
+        remoteCmd = f"{docker} cp {containerID}:/logs/messages.log {localLogFile}"
+        output = subprocess.check_output(shlex.split(remoteCmd), universal_newlines=True)
+    try:
+        f = open(localLogFile, 'r')
+        s = f.read() # read the entire file
+        f.close()
+    except IOError as ioe:
+        logging.warning("Cannot open {filename}: {msg}".format(filename=localLogFile,msg=str(ioe)))
+        return startupTime, firstResponseTime
+    # must remove the logFile
+    if username:
+        cmd = f"ssh {username}@{host} rm {logFileOnHost}"
+        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    cmd = f"rm {localLogFile}"
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    # [10/29/20, 23:18:49:468 UTC] 00000024 com.ibm.ws.kernel.feature.internal.FeatureManager            A CWWKF0011I: The defaultServer server is ready to run a smarter planet. The defaultServer server started in 2.885 seconds.
+    lines = s.splitlines()
+    readyPattern = re.compile('\[(.+)\] .+is ready to run a smarter planet')
+    for line in lines:
+        m = readyPattern.match(line)
+        if m:
+            timestamp = m.group(1)
+            # [10/29/20, 17:53:03:894 EDT]
+            pattern1 = re.compile("(\d+)\/(\d+)\/(\d+),? (\d+):(\d+):(\d+):(\d+) (.+)")
+            m1 = pattern1.match(timestamp)
+            if m1:
+                # Ignore the hour to avoid time zone issues
+                endTime = (int(m1.group(5)) * 60 + int(m1.group(6)))*1000 + int(m1.group(7))
+                if endTime < containerStartTimeMs:
+                    endTime = endTime + 3600*1000 # add one hour
+                startupTime = float(endTime - containerStartTimeMs)
+                break
+            else:
+                logging.warning("Liberty timestamp is in the wrong format: {timestamp}".format(timestamp=timestamp))
+                break
+    if startupTime == math.nan:
+        logging.warning("Liberty instance {containerID} did not start correctly".format(containerID=containerID))
+
+    if curlProcess: # We intend to get the firstResponse time
+        outs = None
+        errs = None
+        try:
+            outs, errs = curlProcess.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            curlProcess.kill()
+            outs, errs = curlProcess.communicate()
+
+        if curlProcess.returncode == 0:
+            firstResponseTimeString = outs #curlProcess.stdout
+            # my output coming from `date +"%H:%M:%S:%N"` is in the format HH:MM:SS:NNNNNNNNN
+            logging.debug(f"Computing first response time. End time is {firstResponseTimeString}")
+            tpattern = re.compile("(\d+):(\d+):(\d+):(\d\d\d)")
+            m2 = tpattern.match(firstResponseTimeString)
+            if m2:
+                # Ignore the hour to avoid time zone issues
+                endTimeMs = (int(m2.group(2))*60 + int(m2.group(3)))*1000 + int(m2.group(4))
+                if endTimeMs < containerStartTimeMs:
+                    endTimeMs = endTimeMs + 3600*1000 # add one hour
+                firstResponseTime = endTimeMs - containerStartTimeMs
+            else:
+                logging.warning("First response time is in the wrong format: {firstResponseTimeString}".format(firstResponseTimeString=firstResponseTimeString))
+
+    return startupTime, firstResponseTime
+
+def startJITServer(serverImage):
+    # -v /tmp/vlogs:/tmp/JITServer_vlog -e TR_Options=\"statisticsFrequency=10000,vlog=/tmp/vlogs/vlog.txt\"
+    #JITOptions = "\"statisticsFrequency=10000,verbose={compilePerformance},verbose={JITServer},vlog=/tmp/vlogs/vlog.txt\""
+    #OTHEROPTIONS= f"'{JITServerOptions}'"
+    JITOptions = ""
+    serverOpts = JITServerOptions
+    otherOpts = ""
+    if JITServerUseEncryption:
+        serverOpts = serverOpts + f" -XX:JITServerSSLKey={SecretsDirInContainer}/key.pem -XX:JITServerSSLCert={SecretsDirInContainer}/cert.pem "
+        otherOpts = f"--mount type=bind,source={KeyAndCertificateDir},destination={SecretsDirInContainer}"
+
+    # -v /tmp/vlogs:/tmp/vlogs
+    remoteCmd = f"{docker} run -d -p 38400:38400 -p 38500:38500 --rm --memory=4G {JITServerAffinity} {netOpts} {otherOpts} {JITServerExtraOptions} -e TR_PrintCompMem=1 -e TR_PrintCompStats=1 -e TR_PrintCompTime=1 -e TR_PrintCodeCacheUsage=1 -e TR_PrintJITServerCacheStats=1 -e TR_PrintJITServerIPMsgStats=1 -e _JAVA_OPTIONS='{serverOpts}' -e TR_Options={JITOptions} --name {JITServerContainerName} {serverImage} jitserver"
+    cmd = f"ssh {JITServerUsername}@{JITServerMachine} \"{remoteCmd}\"" if JITServerUsername else remoteCmd
+    logging.info(f"Start JITServer: {cmd}")
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+
+def stopJITServer():
+    # find the ID of the container, if any
+    remoteCmd = f"{docker} ps --quiet --filter name={JITServerContainerName}"
+    cmd = f"ssh {JITServerUsername}@{JITServerMachine} \"{remoteCmd}\"" if JITServerUsername else remoteCmd
+    output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+    lines = output.splitlines()
+    for containerID in lines:
+        remoteCmd = f"{docker} stop {containerID}"
+        cmd = f"ssh {JITServerUsername}@{JITServerMachine} \"{remoteCmd}\"" if JITServerUsername else remoteCmd
+        logging.debug(f"Stop JITServer: {cmd}")
+        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True)
+
+################################ cleanup ######################################
+def cleanup():
+    for config in configs:
+        removeContainersFromImage(appServerMachine, username, config["image"])
+    stopContainersFromImage(JITServerMachine, JITServerUsername, JITServerImage)
+
+
+def runBenchmarkOnce(image, javaOpts, doMemAnalysis):
+    # Will apply load in small bursts
+    rss, peakRss, cpu = math.nan, math.nan, math.nan
+    curlProcess = None
+
+    # Start an external program called curl_loop in background
+    # This program will keep sending requests to the app server until it responds with 200 once
+    if getFirstResponseTime:
+        curlCmd = f"{firstResponseHelperScript}"
+        curlProcess = subprocess.Popen(shlex.split(curlCmd), universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    crtTime = datetime.datetime.now()
+    containerStartTimeMs = (crtTime.minute * 60 + crtTime.second)*1000 + crtTime.microsecond//1000
+
+    instanceID = startAppServerContainer(host=appServerMachine, username=username, instanceName=containerName, image=image, port=appServerPort, cpus=cpuLimit, mem=memLimit, jvmArgs=javaOpts, mountOpts=mountOpts, doMemAnalysis=doMemAnalysis)
+    if instanceID is None:
+        return math.nan, math.nan, math.nan, math.nan, math.nan
+
+    # We know the app started successfuly
+    # Collect RSS at end of run
+    serverPID = getJavaPIDFromContainer(host=appServerMachine, username=username, instanceID=instanceID)
+
+    if serverPID > 0:
+        rss, peakRss = getRss(host=appServerMachine, username=username, pid=serverPID)
+        logging.debug("Memory: RSS={rss} MB  PeakRSS={peak} MB".format(rss=rss,peak=peakRss))
+        if doMemAnalysis:
+            logging.info("Generating javacore, core and smaps for process {pid}".format(pid=serverPID))
+            collectJavacoreAndSmaps(serverPID)
+            time.sleep(20)
+    else:
+        logging.warning("Cannot get server PID. RSS will not be available")
+    time.sleep(2)
+
+    # stop container and read CompCPU
+    rc = stopAppServerByID(appServerMachine, username, instanceID)
+    cpu = getCompCPUFromContainer(appServerMachine, username, instanceID)
+    startTimeMillis, firstResponseTime = getAppServerStartupTime(appServerMachine, username, instanceID, containerStartTimeMs, curlProcess)
+    removeForceContainer(host=appServerMachine, username=username, instanceName=containerName)
+
+    # return throughput as an array of throughput values for each burst and also the RSS
+    return rss, peakRss, float(cpu/1000.0), startTimeMillis, firstResponseTime
+
+####################### runBenchmarksIteratively ##############################
+def runBenchmarkIteratively(numIter, image, javaOpts):
+    logging.info("Starting {iter} iterations of {image} with {javaOpts}".format(iter=numIter,image=image,javaOpts=javaOpts))
+    # Initialize stats
+    rssResults = [] # Just a list
+    peakRssResults = []
+    cpuResults = []
+    startupResults = []
+    firstResponseResults = []
+
+    # clear SCC if needed (by destroying the SCC volume)
+    if doColdRun:
+        clearSCC(appServerMachine, username)
+
+    useJITServer = ("-XX:+UseJITServer" in javaOpts) or (instantOnRestore and ("-XX:+UseJITServer" in postRestoreOpts))
+    if useJITServer:
+        # If the JITServer image has been specifically provided, use that; otherwise use the image for test
+        serverImage = JITServerImage if JITServerImage else image
+        startJITServer(serverImage)
+        time.sleep(1) # Give JITServer some time to start
+
+    for iter in range(numIter):
+        # if memAnalysis is True, add the options required for memory analysis, but only for the last iteration
+        doMemAnalysis = memAnalysis and iter == numIter - 1
+        if doMemAnalysis:
+            javaOpts = javaOpts + extraArgsForMemAnalysis
+        rss, peakRss, cpu, startupTime, firstResponseTime = runBenchmarkOnce(image, javaOpts, doMemAnalysis)
+        # Print the results for this iteration
+        print(f"Iteration {iter:d}: StartTime={startupTime:.0f} ms RSS={rss:.1f} MB  PeakRSS={peakRss:.1f} MB CompCPU={cpu:.2f} sec")
+
+        rssResults.append(rss)
+        peakRssResults.append(peakRss)
+        cpuResults.append(cpu)
+        startupResults.append(startupTime)
+        firstResponseResults.append(firstResponseTime)
+
+    # print stats
+    print(f"\nResults for image: {image} and opts: {javaOpts}")
+    printStats(startupResults, "StartTime stats:")
+    printStats(rssResults, "RSS stats:")
+    printStats(peakRssResults, "Peak RSS stats:")
+    printStats(cpuResults, "CompCPU stats:")
+    if getFirstResponseTime:
+        printStats(firstResponseResults, "FirstResp stats:")
+
+    if useJITServer:
+        stopJITServer()
+
+############################ MAIN ##################################
+def mainRoutine():
+    if  len(sys.argv) < 2:
+        print ("Program must have an argument: the number of iterations\n")
+        sys.exit(-1)
+
+    cleanup() # Clean-up from a previous possible bad run
+
+    if doColdRun:
+        logging.warning("Will do a cold run before each set")
+
+    for config in configs:
+        runBenchmarkIteratively(numIter=int(sys.argv[1]), image=config["image"], javaOpts=config["args"])
+
+    # Execute final clean-up step
+    cleanup()
+
+mainRoutine()

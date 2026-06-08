@@ -118,9 +118,13 @@ def parseVlog(vlog):
     methodCompTimes = {} # hash that maps method names to compilation times
     firstTimeCompsExplainNonAOTLoad = {} # hash that maps method names to a tuple {vlogCompLine, AOTLoadFail?, JNI?, AOTLoad?, FollowAOTLoadFail}
     startTime = 0 # ms
+    totalInlined = 0 # total number of callees inlined
+    inlineCount = 0 # number of methods with inlining info
 
     #  (cold) Compiling java/lang/Double.longBitsToDouble(J)D  OrdinaryMethod j9m=0000000000097B18 t=20 compThreadID=0 memLimit=262144 KB freePhysicalMemory=75755 MB
     compStartPattern = re.compile(r'^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
+    # #INL:   123 methods inlined into java/lang/String.indexOf(Ljava/lang/String;)I
+    inlinePattern = re.compile(r"^#INL:\s+(\d+) methods inlined into")
     # + (cold) sun/reflect/Reflection.getCallerClass()Ljava/lang/Class; @ 00007FB21300003C-00007FB213000167 OrdinaryMethod - Q_SZ=1 Q_SZI=1 QW=2 j9m=000000000004D1D8 bcsz=2 JNI time=995us mem=[region=704 system=2048]KB compThreadID=0 CpuLoad=163%(10%avg) JvmCpu=0%
     # + (AOT load) java/lang/String.lengthInternal()I @ 00007FA6F8001140-00007FA6F8001168 Q_SZ=1 Q_SZI=1 QW=2 j9m=00000000000493F8 bcsz=37 time=51us compThreadID=0 queueTime=293us
     compEndPattern  = re.compile(r'^\+ \(([\S -]+)\) (\S+) \@ (0x)?([0-9A-F]+)-(0x)?([0-9A-F]+)\s.*Q_SZ=(\d+).+ time=(\d+)us')
@@ -370,6 +374,14 @@ def parseVlog(vlog):
                 print("Interpreted method could not be identified from line:", line)
             numInterpreted += 1
 
+        # Check for inlining information
+        if line.startswith("#INL:"):
+            m = inlinePattern.match(line)
+            if m:
+                numCallees = int(m.group(1))
+                totalInlined += numCallees
+                inlineCount += 1
+
     # Print statistics
     printHeaderStats()
     printStats("Total", compTimes)
@@ -431,6 +443,16 @@ def parseVlog(vlog):
         print(numInterpreted, "methods will continue as interpreted due to compilation filters")
         for method in interpretedMethods:
             print("\t", method)
+
+    # Print average number of callees inlined
+    if inlineCount > 0:
+        avgInlined = totalInlined / inlineCount
+        print(f"\nInlining statistics:")
+        print(f"Total methods inlined: {totalInlined}")
+        print(f"Number of methods with inlining: {inlineCount}")
+        print(f"Average callees inlined per method: {avgInlined:.2f}")
+    else:
+        print("\nNo inlining information found in vlog")
     if printAOTLoadsNotRecompiled:
         print("\nAOT loads that were not recompiled:")
         sortedMethods = sorted(aotLoadsNotRecompiled)

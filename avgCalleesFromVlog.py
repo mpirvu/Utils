@@ -8,7 +8,7 @@ def computeAverageInlined(filePath):
     count = 0
 
     with open(filePath, 'r') as file:
-        pattern = re.compile("^#INL:\s+(\d+) methods inlined into")
+        pattern = re.compile(r"^#INL:\s+(\d+) methods inlined into")
         for line in file:
             line = line.strip()
             if line.startswith("#INL:"):

@@ -7,6 +7,15 @@
 import re # for regular expressions
 import sys # for accessing parameters and exit
 
+# Try to import matplotlib for graph generation
+try:
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    print("Warning: matplotlib not available. Graph generation will be disabled.")
+    print("To enable graph generation, install matplotlib: pip install matplotlib")
+
 ################## Configuration #####################
 # Compilations that take more than this value (in usec) are printed on screen
 compTimeThreshold = 1000000
@@ -37,6 +46,13 @@ printFirstCompilationsNonAOTLoads = False
 # where X is incremeted by 5 percentage points until it reaches 100%.
 printCompTimeCDF = False
 compTimeCDFFilename = "cdf.txt"
+
+# If set to True, the script will print queue size and JVM CPU data to a file
+# The file will have 3 tab-separated columns: timestamp, Q_SZ, JvmCpu
+printQueueSizeData = False
+queueSizeDataFilename = "queuesize_jvmcpu.txt"
+generateQueueSizeGraph = False  # If True, generate a graph from Q_SZ and CPU data
+queueSizeGraphFilename = "queuesize_jvmcpu.png"
 
 
 #######################################################
@@ -120,6 +136,14 @@ def parseVlog(vlog):
     startTime = 0 # ms
     totalInlined = 0 # total number of callees inlined
     inlineCount = 0 # number of methods with inlining info
+
+    # Variables for tracking queue size and JVM CPU over time
+    oldTimeMs = 0
+    qszList = []
+    lastQSZvalue = 0
+    lastCPUvalue = 0
+    jvmCpuList = []
+    qszDataPoints = [] # List of tuples (timestamp, qsz, cpu)
 
     #  (cold) Compiling java/lang/Double.longBitsToDouble(J)D  OrdinaryMethod j9m=0000000000097B18 t=20 compThreadID=0 memLimit=262144 KB freePhysicalMemory=75755 MB
     compStartPattern = re.compile(r'^.+\((.+)\) Compiling (\S+) .+ t=(\d+)')
@@ -347,6 +371,26 @@ def parseVlog(vlog):
                     if match:
                         crtTimeMs = int(match.group(1))
 
+                # Track queue size and JVM CPU data for printing to file
+                if printQueueSizeData and crtTimeMs > oldTimeMs:
+                    # Time has changed, record the maximum value for Q_SZ and JVM CPU seen in the previous interval
+                    qsz = 0
+                    if len(qszList) > 0:
+                        qsz = max(qszList)
+                    else:
+                        qsz = lastQSZvalue
+
+                    cpu = 0
+                    if len(jvmCpuList) > 0:
+                        cpu = max(jvmCpuList)
+                    else:
+                        cpu = lastCPUvalue
+
+                    qszDataPoints.append((oldTimeMs, qsz, cpu))
+                    qszList = []
+                    jvmCpuList = []
+                    oldTimeMs = crtTimeMs
+
         m = jvmCpuPattern.match(line)
         if m:
             jvmCPU = int(m.group(1))
@@ -373,6 +417,17 @@ def parseVlog(vlog):
             else:
                 print("Interpreted method could not be identified from line:", line)
             numInterpreted += 1
+
+        # Track Q_SZ values for queue size data
+        if printQueueSizeData:
+            match = re.search(r"Q_SZ=(\d+)", line)
+            if match:
+                lastQSZvalue = int(match.group(1))
+                qszList.append(lastQSZvalue)
+            match = re.search(r"\sJvmCpu=(\d+)\%", line)
+            if match:
+                lastCPUvalue = int(match.group(1))
+                jvmCpuList.append(lastCPUvalue)
 
         # Check for inlining information
         if line.startswith("#INL:"):
@@ -491,6 +546,51 @@ def parseVlog(vlog):
                 # Also ignore AOT compilations and EDO triggerred compilations
                 if not ("+ (AOT" in info["line"]) and not (" EDO " in info["line"]):
                     print(info["line"], end='')
+
+    # Write queue size and JVM CPU data to file if requested
+    if printQueueSizeData and len(qszDataPoints) > 0:
+        print(f"\nWriting queue size and JVM CPU data to {queueSizeDataFilename}")
+        with open(queueSizeDataFilename, 'w') as qszFile:
+            qszFile.write("Timestamp(ms)\tQ_SZ\tJvmCpu(%)\n")
+            for timestamp, qsz, cpu in qszDataPoints:
+                qszFile.write(f"{timestamp:8d}\t{qsz:5d}\t{cpu:4d}\n")
+
+        # Generate graph if requested
+        if generateQueueSizeGraph:
+            if not MATPLOTLIB_AVAILABLE:
+                print("Warning: Cannot generate graph - matplotlib is not installed")
+                print("Install matplotlib with: pip install matplotlib")
+            else:
+                print(f"Generating graph and saving to {queueSizeGraphFilename}")
+
+                # Extract data for plotting
+                timestamps = [dp[0] for dp in qszDataPoints]
+                qsz_values = [dp[1] for dp in qszDataPoints]
+                cpu_values = [dp[2] for dp in qszDataPoints]
+
+                # Create figure with two subplots sharing x-axis
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+                # Plot Queue Size
+                ax1.plot(timestamps, qsz_values, 'b-', linewidth=1)
+                ax1.set_ylabel('Queue Size (Q_SZ)', fontsize=12, color='b')
+                ax1.tick_params(axis='y', labelcolor='b')
+                ax1.grid(True, alpha=0.3)
+                ax1.set_title('Compilation Queue Size and JVM CPU Utilization Over Time', fontsize=14, fontweight='bold')
+
+                # Plot JVM CPU
+                ax2.plot(timestamps, cpu_values, 'r-', linewidth=1)
+                ax2.set_xlabel('Time (ms)', fontsize=12)
+                ax2.set_ylabel('JVM CPU (%)', fontsize=12, color='r')
+                ax2.tick_params(axis='y', labelcolor='r')
+                ax2.grid(True, alpha=0.3)
+
+                # Adjust layout and save
+                plt.tight_layout()
+                plt.savefig(queueSizeGraphFilename, dpi=150, bbox_inches='tight')
+                plt.close()
+
+                print(f"Graph saved to {queueSizeGraphFilename}")
 ###################################################
 
 if startLine != 0 or endLine != -1:

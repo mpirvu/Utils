@@ -16,7 +16,7 @@ from datetime import datetime
 import platform
 
 # Configuration variables
-verbose = 5  # 1 or 2, for increasing verbosity
+verbose = 1  # 1 or 2, for increasing verbosity
 do_cold_run = True  # clear SCC and do a cold run first
 use_vmmap = False
 report_ws = True  # report working set size
@@ -24,23 +24,26 @@ report_cpu = True
 report_cold_run_stats = True
 wait_time_to_start = 10
 cpu_affinity = "0x3"
-liberty_dir = "c://tmp//OL-26.0.0.4//liberty"
-app_name = "emptyserver"  # "EmptyProfile"
+liberty_dir = "/opt/IBM/OL-26.0.0.4/liberty"
+app_name = "acmeairee8"  # "EmptyProfile"
 app_dir = f"{liberty_dir}/usr/servers/{app_name}"
 log_dir = f"{app_dir}/logs"
 log_file = f"{log_dir}/messages.log"
 console_log_file = f"{log_dir}/console.log"
-run_cmd = f"{liberty_dir}//bin//server.bat start {app_name}"
-stop_cmd = f"{liberty_dir}//bin//server.bat stop {app_name}"
+run_cmd = f"{liberty_dir}/bin/server start {app_name}"
+stop_cmd = f"{liberty_dir}/bin/server stop {app_name}"
 pid_file = f"{liberty_dir}/usr/servers/.pid/{app_name}.pid"
 working_set_file = "WS.txt"
+loop_curl_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loop_curl_acmeair.sh")
+http_endpoint = "http://localhost:9080"  # URL probed for time-to-first-response
+measure_first_response = True  # set False to skip curl probing
 vmmap_executable = "C://Apps//Sysinternals//vmmap.exe"
 vmmap_dir = "C://tmp//"
 send_signal_executable = "C://IBM//sendCtrlBreak-64bit.exe"
 get_working_set_executable = "C://tmp//GetWorkingSet.exe"
 
 # Footprint
-footprint_monitor = True
+footprint_monitor = False
 do_mem_analysis = False
 dir_for_mem_analysis_files = "/tmp"
 extra_args_for_mem_analysis = (
@@ -52,11 +55,12 @@ use_different_options_for_cold = False
 options_for_cold = "-Xquickstart -Xjit:enableInterpreterProfiling -Xmx256m -Xshareclasses:enableBCI,name=liberty -Xscmx60M -Xscmaxaot4m"
 
 jvm_options = [
-    "-Xmx512m -Xscmx200m",
+    "-Xmx128m",
 ]
 
 jdks = [
-    "c://tmp//OpenJ9-JDK26-x86-64_windows-20260614-085147",
+    #"c://tmp//OpenJ9-JDK26-x86-64_windows-20260614-085147",
+    "/home/mpirvu/sdks/ibm-semeru-open-jdk_x64_linux_26.0.2.10"
 ]
 
 
@@ -449,7 +453,7 @@ def clear_scc(java_home):
 
 def run_benchmark_once(wait_time, java_home, jvm_opts, app_args,
                        collect_footprint_diagnostic):
-    """Run the benchmark once and return startup time."""
+    """Run the benchmark once and return startup time, first-response time, and RSS."""
     delete_trace_files()
     large_page_footprint_start = get_large_pages_footprint()
 
@@ -462,6 +466,22 @@ def run_benchmark_once(wait_time, java_home, jvm_opts, app_args,
     if verbose >= 2:
         print(f"+ Will execute {run_cmd} {app_args}")
 
+    # Start the curl probe loop *before* Liberty so it is ready the instant the
+    # server can serve its first HTTP response.
+    curl_proc = None
+    if measure_first_response and not is_windows():
+        try:
+            curl_proc = subprocess.Popen(
+                ["bash", loop_curl_script],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True
+            )
+            if verbose >= 2:
+                print(f"+ Started curl probe (PID={curl_proc.pid}) for {http_endpoint}")
+        except Exception as e:
+            print(f"Warning: could not start loop_curl.sh: {e}")
+            curl_proc = None
+
     start_time = time.time()
 
     try:
@@ -473,7 +493,9 @@ def run_benchmark_once(wait_time, java_home, jvm_opts, app_args,
             subprocess.run(f"{run_cmd} {app_args} 2> err.txt", shell=True)
     except Exception as e:
         print(f"Error running benchmark: {e}")
-        return (0, 0)
+        if curl_proc:
+            curl_proc.kill()
+        return (0, 0, 0, 0)
 
     if verbose >= 2:
         print("+ Start command finished")
@@ -505,7 +527,9 @@ def run_benchmark_once(wait_time, java_home, jvm_opts, app_args,
                 raise Exception("No java process found")
         except Exception as e:
             print(f"Error finding java process: {e}")
-            return (0, 0)
+            if curl_proc:
+                curl_proc.kill()
+            return (0, 0, 0, 0)
     else:
         try:
             result = subprocess.run(["pgrep", "java"], capture_output=True, text=True)
@@ -536,7 +560,52 @@ def run_benchmark_once(wait_time, java_home, jvm_opts, app_args,
 
     java_pid = verify_liberty_started(get_trace_filename())
     if java_pid == 0:
-        return (0, 0)
+        if curl_proc:
+            curl_proc.kill()
+        return (0, 0, 0, 0)
+
+    # Wait for the curl probe to finish and parse its timestamp output.
+    first_response_time = 0
+    rss_at_first_response = 0
+    if curl_proc is not None:
+        try:
+            curl_stdout, _ = curl_proc.communicate(timeout=120)
+            # loop_curl.sh prints a single line: HH:MM:SS.NNNNNNNNN
+            timestamp_line = curl_stdout.strip()
+            if timestamp_line:
+                if verbose >= 2:
+                    print(f"+ curl probe finished, timestamp: {timestamp_line}")
+                # Parse HH:MM:SS.nanoseconds produced by `date +"%H:%M:%S.%N"`
+                if ts_match := re.match(r'(\d+):(\d+):(\d+)\.(\d+)', timestamp_line):
+                    now = datetime.now()
+                    first_resp_dt = now.replace(
+                        hour=int(ts_match.group(1)),
+                        minute=int(ts_match.group(2)),
+                        second=int(ts_match.group(3)),
+                        microsecond=int(ts_match.group(4)[:6].ljust(6, '0'))
+                    )
+                    first_response_time = (first_resp_dt.timestamp() - start_time) * 1000  # ms
+                    if verbose >= 1:
+                        print(f"+ Time to first response: {first_response_time:.0f} ms")
+
+                # Capture RSS right after first response
+                try:
+                    rss_result = subprocess.run(
+                        ["ps", "--no-headers", "-o", "rss", "-p", str(java_pid)],
+                        capture_output=True, text=True
+                    )
+                    rss_text = rss_result.stdout.strip()
+                    if rss_text:
+                        rss_at_first_response = int(rss_text)
+                        if verbose >= 1:
+                            print(f"+ RSS at first response: {rss_at_first_response} kB")
+                except Exception as e:
+                    print(f"Warning: could not read RSS: {e}")
+        except subprocess.TimeoutExpired:
+            print("Warning: curl probe did not finish within 120 s; killing it")
+            curl_proc.kill()
+        except Exception as e:
+            print(f"Warning: error reading curl probe output: {e}")
 
     cpu_time = 0
     if report_ws:
@@ -579,7 +648,7 @@ def run_benchmark_once(wait_time, java_home, jvm_opts, app_args,
 
     startup_time = (end_epoch_seconds - start_time) * 1000 + (end_epoch_microseconds) / 1000
 
-    return (startup_time, cpu_time)
+    return (startup_time, cpu_time, first_response_time, rss_at_first_response)
 
 
 def run_benchmark_iteratively(num_iter, java_home, jvm_opts, results_array):
@@ -614,7 +683,7 @@ def run_benchmark_iteratively(num_iter, java_home, jvm_opts, results_array):
 
         do_footprint_diagnostic = do_mem_analysis and (i == num_iter - 1)
 
-        startup_time, cpu_time = run_benchmark_once(
+        startup_time, cpu_time, first_response_time, rss_at_first_response = run_benchmark_once(
             wait_time_to_start, java_home, java_opts, app_args, do_footprint_diagnostic
         )
 
@@ -624,6 +693,10 @@ def run_benchmark_iteratively(num_iter, java_home, jvm_opts, results_array):
         if startup_time > 0:
             results_array[i]["startupTime"] = startup_time
             results_array[i]["processTime"] = cpu_time
+            if first_response_time > 0:
+                results_array[i]["firstResponseTime"] = first_response_time
+            if rss_at_first_response > 0:
+                results_array[i]["rssAtFirstResponse"] = rss_at_first_response
 
             if verbose >= 1:
                 print(f"ProcessCPU={cpu_time}")
@@ -683,6 +756,8 @@ def print_all_performance_numbers(results, num_batches, num_iter):
             comp_cpu_time = []
             footprint = []
             process_time = []
+            first_response_time = []
+            rss_at_first_response = []
 
             for batch_id in range(num_batches):
                 run_id = 2 if do_cold_run else 0
@@ -703,6 +778,14 @@ def print_all_performance_numbers(results, num_batches, num_iter):
                     if val > 0:
                         process_time.append(val)
 
+                    val = results[jdk_id][opt_id][batch_id][run_id].get("firstResponseTime", 0)
+                    if val > 0:
+                        first_response_time.append(val)
+
+                    val = results[jdk_id][opt_id][batch_id][run_id].get("rssAtFirstResponse", 0)
+                    if val > 0:
+                        rss_at_first_response.append(val)
+
             # Print statistics
             if startup_time:
                 print_statistics("StartupTime", startup_time)
@@ -712,6 +795,10 @@ def print_all_performance_numbers(results, num_batches, num_iter):
                 print_statistics("CThreadTime", comp_cpu_time)
             if process_time:
                 print_statistics("ProcessTime", process_time)
+            if first_response_time:
+                print_statistics("FirstResponseTime", first_response_time)
+            if rss_at_first_response:
+                print_statistics("RSSAtFirstResponse", rss_at_first_response)
 
             # Print cold run stats
             if do_cold_run and report_cold_run_stats:
@@ -719,6 +806,8 @@ def print_all_performance_numbers(results, num_batches, num_iter):
                 comp_cpu_time = []
                 footprint = []
                 process_time = []
+                first_response_time = []
+                rss_at_first_response = []
 
                 for batch_id in range(num_batches):
                     val = results[jdk_id][opt_id][batch_id][0].get("startupTime", 0)
@@ -737,6 +826,14 @@ def print_all_performance_numbers(results, num_batches, num_iter):
                     if val > 0:
                         process_time.append(val)
 
+                    val = results[jdk_id][opt_id][batch_id][0].get("firstResponseTime", 0)
+                    if val > 0:
+                        first_response_time.append(val)
+
+                    val = results[jdk_id][opt_id][batch_id][0].get("rssAtFirstResponse", 0)
+                    if val > 0:
+                        rss_at_first_response.append(val)
+
                 print("Stats for cold run:")
                 if startup_time:
                     print_statistics("StartupTime", startup_time)
@@ -746,6 +843,10 @@ def print_all_performance_numbers(results, num_batches, num_iter):
                     print_statistics("CThreadTime", comp_cpu_time)
                 if process_time:
                     print_statistics("ProcessTime", process_time)
+                if first_response_time:
+                    print_statistics("FirstResponseTime", first_response_time)
+                if rss_at_first_response:
+                    print_statistics("RSSAtFirstResponse", rss_at_first_response)
 
 
 def main():
@@ -779,6 +880,8 @@ def main():
                         "compCPUTime": 0,
                         "footprint": 0,
                         "processTime": 0,
+                        "firstResponseTime": 0,
+                        "rssAtFirstResponse": 0,
                     })
 
     # Run benchmarks

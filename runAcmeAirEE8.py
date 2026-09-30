@@ -21,11 +21,11 @@ docker = "podman" # Select between docker and podman
 netOpts = "--network=slirp4netns" if docker == "podman" else "" # for podman we need to use slirp4netns if running as root. This will be added to Liberty. mongo uses host network.
 
 ################### Benchmark configuration #################
-doColdRun          = False # when True we clear the SCC before the first run. Set it to False for embedded SCC
+doColdRun          = True # when True we clear the SCC before the first run. Set it to False for embedded SCC
 doOnlyColdRuns     = False # when True we run only the cold runs (doColdRun flag is ignored)
 AppServerHost      = "localhost" # the host where the app server is running from the point of view of the JMeter machine
 AppServerPort      = 9080
-AppServerLocation  = "/opt/IBM/OL-23.0.0.3/liberty"
+AppServerLocation  = "/opt/IBM/OL-26.0.0.4/liberty"
 applicationName    = "acmeairee8"
 AppServerAffinity  = "taskset 0x1"
 applicationLocation= f"{AppServerLocation}/usr/servers/{applicationName}"
@@ -34,6 +34,9 @@ appServerStartCmd  = f"{AppServerAffinity} {AppServerLocation}/bin/server run {a
 appServerStopCmd   = f"{AppServerLocation}/bin/server stop {applicationName}"
 startupWaitTime    = 30 # seconds to wait before checking to see if AppServer is up
 printAppServerStderr = True
+measureFirstResponse = False  # When True, probe the HTTP endpoint to measure time-to-first-response
+firstResponseUrl     = f"http://{AppServerHost}:{AppServerPort}/"  # URL polled by the curl probe
+firstResponseTimeout = 60  # seconds to wait for first HTTP 200 before giving up
 
 memAnalysis = False # Collect javacores and smaps for memory analysis
 dirForMemAnalysisFiles = "/tmp"
@@ -43,7 +46,8 @@ extraArgsForMemAnalysis = f" -Dcom.ibm.dbgmalloc=true -Xdump:none -Xdump:system:
 collectPerfProfileForJIT = False # Collect perf profile of the "main" compilation thread
 collectPerfProfileForJVM = False  # Collect perf profile for the entire JVM
 perfProfileOutput = "/tmp/perf.data"
-perfCmd= f"perf record -e cycles -c 200000"
+#perfCmd= f"perf record -e cycles -c 200000"
+perfCmd= f"perf record -e task-clock"
 perfDuration = 180 # seconds
 
 
@@ -69,6 +73,7 @@ jmeterAffinity      = "16-19"
 printRampup         = False # If True, print all JMeter throughput values to plot rampup curve
 
 ################ Load CONFIG ###############
+doApplyLoad             = True  # When False, skip load phases; only startup time and footprint are collected
 numRepetitionsOneClient = 0
 numRepetitions50Clients = 2
 durationOfOneClient     = 60 # seconds
@@ -100,7 +105,8 @@ jvmOptions = [
 ]
 
 jdks = [
-    "/home/mpirvu/FullJava17/openj9-openjdk-jdk17/build/linux-x86_64-server-release/images/jdk",
+    #"/home/mpirvu/FullJava17/openj9-openjdk-jdk17/build/linux-x86_64-server-release/images/jdk",
+    "/home/mpirvu/sdks/ibm-semeru-open-jdk_x64_linux_26.0.2.10",
 ]
 
 def count_not_nan(myList):
@@ -403,7 +409,7 @@ def collectJITPerfProfile(javaPID):
 def collectJVMPerfProfile(javaPID):
     perfProcess = None
     outputFile = f"{perfProfileOutput}.{javaPID}"
-    cmd = f"{perfCmd} -o {outputFile} --pid {javaPID} --delay=10000 -- sleep {perfDuration}"
+    cmd = f"{perfCmd} -o {outputFile} --pid {javaPID} --delay=20000 -- sleep {perfDuration}"
     try:
         # Fork a process and run in background
         perfProcess = subprocess.Popen(shlex.split(cmd), universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -440,7 +446,7 @@ def verifyAppserverStarted():
         try:
             with open(logFile) as f:
                 for line in f:
-                    print(line)
+                    print(line, end="")
                     m = errPattern.match(line)
                     if m:
                         logging.warning("AppServer {applicationName} errored while starting:\n\t {line}").format(applicationName=applicationName,line=line)
@@ -475,9 +481,54 @@ def startAppServer(jdk, jvmArgs):
     myEnv["TR_PrintJITServerMsgStats"] = "1"
     myEnv["TR_PrintJITServerAOTCacheStats"] = "1"
     myEnv["MONGO_HOST"] = dbMachine
-    myEnv["MONGO_PORT"] = dbPort
-    # Fork a process and run in background
+    myEnv["MONGO_PORT"] = str(dbPort)
+    # Fork Liberty in the background; PID is known immediately
     childProcess = subprocess.Popen(shlex.split(appServerStartCmd), env=myEnv, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    logging.debug("AppServer launched with pid {pid}".format(pid=childProcess.pid))
+
+    # Launch curl probe now that we have the Liberty PID.
+    # The probe loops until the HTTP endpoint returns 200, then prints:
+    #   line 1: HH:MM:SS:NNNNNNNNN   (date +"%H:%M:%S:%N")
+    #   line 2: VmRSS:   <n> kB      (grep VmRSS /proc/<pid>/status)
+    firstRespTimestamp = math.nan
+    rssAtFirstResponse = math.nan
+    if measureFirstResponse:
+        pid = childProcess.pid
+        curlCmd = (
+            f"while [[ \"$(curl -s -o /dev/null -w '%{{http_code}}' '{firstResponseUrl}')\" != \"200\" ]];"
+            f" do sleep .00001; done;"
+            f" date +\"%H:%M:%S:%N\";"
+            f" grep VmRSS /proc/{pid}/status"
+        )
+        try:
+            curlProc = subprocess.Popen(
+                ["bash", "-c", curlCmd],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                universal_newlines=True
+            )
+            logging.debug(f"curl probe started (PID={curlProc.pid}) polling {firstResponseUrl}")
+            try:
+                curlOut, _ = curlProc.communicate(timeout=firstResponseTimeout)
+                lines = curlOut.strip().splitlines()
+                if len(lines) >= 2:
+                    # Parse timestamp: HH:MM:SS:NNNNNNNNN
+                    tsMatch = re.match(r'(\d+):(\d+):(\d+):(\d+)', lines[0].strip())
+                    if tsMatch:
+                        firstRespTimestamp = (int(tsMatch.group(2)) * 60 + int(tsMatch.group(3))) * 1000 + int(tsMatch.group(4)[:3].ljust(3, '0'))
+                        logging.debug(f"First-response timestamp: {lines[0].strip()} -> {firstRespTimestamp} ms (within-hour)")
+                    # Parse VmRSS: "VmRSS:   142336 kB"
+                    rssMatch = re.match(r'VmRSS:\s+(\d+)\s+kB', lines[1].strip())
+                    if rssMatch:
+                        rssAtFirstResponse = int(rssMatch.group(1)) / 1024.0  # kB -> MB
+                        logging.debug(f"RSS at first response: {rssAtFirstResponse:.1f} MB")
+                else:
+                    logging.warning("curl probe returned unexpected output: " + curlOut.strip())
+            except subprocess.TimeoutExpired:
+                logging.warning(f"curl probe did not get HTTP 200 within {firstResponseTimeout} s; killing it")
+                curlProc.kill()
+        except Exception as e:
+            logging.warning(f"Failed to run curl probe: {e}")
+
     logging.debug(f"Waiting for {startupWaitTime} sec for the AppServer to start")
     time.sleep(startupWaitTime)
     startOK = False
@@ -490,13 +541,13 @@ def startAppServer(jdk, jvmArgs):
             outs, errs = childProcess.communicate(timeout=15)
             print(outs)
             killAppServerIfRunning(childProcess)
-            return None
+            return None, math.nan, math.nan
         else:
             logging.debug("AppServer started OK")
     else:
         logging.error("AppServer did not start")
-        return None
-    return childProcess
+        return None, math.nan, math.nan
+    return childProcess, firstRespTimestamp, rssAtFirstResponse
 
 
 def stopAppServer(childProcess):
@@ -601,7 +652,7 @@ def applyLoad(duration, numClients):
 
 def getThroughput():
     logging.debug("Getting throughput info...")
-    remoteCmd = f"{docker} logs --tail=200 {jmeterContainerName}"
+    remoteCmd = f"{docker} logs --tail=250 {jmeterContainerName}"
     cmd = f"ssh {jmeterUsername}@{jmeterMachine} \"{remoteCmd}\"" if jmeterUsername else remoteCmd
     output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.DEVNULL)
     lines = output.splitlines()
@@ -700,17 +751,26 @@ def runBenchmarkOnce(jdk, jvmArgs, doMemAnalysis):
     # Will apply load in small bursts
     maxPulses = numRepetitionsOneClient + numRepetitions50Clients
     thrResults = [math.nan for i in range(maxPulses)] # np.full((maxPulses), fill_value=np.nan, dtype=np.float)
-    rss, peakRss, cpu, startupTime = math.nan, math.nan, math.nan, math.nan
+    rss, peakRss, rssAfterStartup, cpu, startupTime = math.nan, math.nan, math.nan, math.nan, math.nan
+    firstResponseTime, rssAtFirstResponse = math.nan, math.nan
     peakThroughput = math.nan
 
-    restoreDatabase(dbMachine, dbUsername)
+    if doApplyLoad:
+        restoreDatabase(dbMachine, dbUsername)
 
     crtTime = datetime.datetime.now()
     startTimeMs = (crtTime.minute * 60 + crtTime.second)*1000 + crtTime.microsecond//1000
 
-    childProcess = startAppServer(jdk=jdk, jvmArgs=jvmArgs)
+    childProcess, firstRespTimestamp, rssAtFirstResponse = startAppServer(jdk=jdk, jvmArgs=jvmArgs)
     if childProcess is None: # Failed to start properly
-        return thrResults, peakThroughput, rss, peakRss, cpu, startupTime
+        return thrResults, peakThroughput, rssAfterStartup, rss, peakRss, cpu, startupTime, firstResponseTime, rssAtFirstResponse
+
+    # Compute first-response time using the same wrap-around arithmetic as getStartupTime()
+    if not math.isnan(firstRespTimestamp):
+        firstResponseTime = firstRespTimestamp - startTimeMs
+        if firstResponseTime < 0:
+            firstResponseTime += 3600 * 1000  # timestamp wrapped past an hour boundary
+        logging.debug(f"First-response time: {firstResponseTime:.0f} ms")
 
     # Compute AppServer start-up time
     startupTime = getStartupTime(startTimeMs)
@@ -721,35 +781,47 @@ def runBenchmarkOnce(jdk, jvmArgs, doMemAnalysis):
         else:
             logging.error("Failed to start JIT perf profiling because Java process has terminated")
 
-    peakThroughput = 0
-    for pulse in range(maxPulses):
-        # Determine run characteristics
-        if pulse >= numRepetitionsOneClient:
-            cli = numClients
-            duration = durationOfOneRepetition
-        else:
-            cli = 1
-            duration = durationOfOneClient
-        # If enabled, start the JVM profiling thread in the background
-        if collectPerfProfileForJVM and pulse == maxPulses-1:
-            if childProcess.poll() is None: # Still running:
-                collectJVMPerfProfile(childProcess.pid)
+    # Collect RSS right after startup (before any load)
+    if childProcess.poll() is None:
+        rssAfterStartup, _ = getRss(pid=childProcess.pid)
+
+    if doApplyLoad:
+        cmd = f"curl --ipv4 -v http://{AppServerHost}:{AppServerPort}/rest/info/loader/load?numCustomers=10000"
+        logging.debug(f"Init database: {cmd}")
+        output = subprocess.check_output(shlex.split(cmd), universal_newlines=True, stderr=subprocess.STDOUT)
+        logging.debug(output)
+
+        peakThroughput = 0
+        for pulse in range(maxPulses):
+            # Determine run characteristics
+            if pulse >= numRepetitionsOneClient:
+                cli = numClients
+                duration = durationOfOneRepetition
             else:
-                logging.error("Failed to start JVM perf profiling because Java process has terminated")
+                cli = 1
+                duration = durationOfOneClient
+            # If enabled, start the JVM profiling thread in the background
+            if collectPerfProfileForJVM and pulse == maxPulses-1:
+                if childProcess.poll() is None: # Still running:
+                    collectJVMPerfProfile(childProcess.pid)
+                else:
+                    logging.error("Failed to start JVM perf profiling because Java process has terminated")
 
-        thrResults[pulse], elapsed, peakThr, errors = runPhase(duration, cli)
-        if errors == 0:
-            peakThroughput = max(peakThroughput, peakThr)
-        logging.info("Throughput={thr}".format(thr=thrResults[pulse]))
+            thrResults[pulse], elapsed, peakThr, errors = runPhase(duration, cli)
+            if errors == 0:
+                peakThroughput = max(peakThroughput, peakThr)
+            logging.info("Throughput={thr}".format(thr=thrResults[pulse]))
 
-    # Collect RSS at end of run
-    if childProcess.poll() is None: # Still running
-        rss, peakRss = getRss(pid=childProcess.pid)
+        # Collect RSS after load
+        if childProcess.poll() is None: # Still running
+            rss, peakRss = getRss(pid=childProcess.pid)
+        else:
+            rss, peakRss = rssAfterStartup, rssAfterStartup
 
-        if doMemAnalysis:
-            logging.info("Generating javacore, core and smaps for process {pid}".format(pid=childProcess.pid))
-            collectJavacoreAndSmaps(childProcess.pid)
-            time.sleep(20)
+    if doMemAnalysis and childProcess.poll() is None:
+        logging.info("Generating javacore, core and smaps for process {pid}".format(pid=childProcess.pid))
+        collectJavacoreAndSmaps(childProcess.pid)
+        time.sleep(20)
 
     # Stop the AppServer
     stopAppServer(childProcess)
@@ -758,16 +830,19 @@ def runBenchmarkOnce(jdk, jvmArgs, doMemAnalysis):
     cpu = getCompCPU(childProcess)
 
     # return throughput as an array of throughput values for each burst and also the RSS, PeakRSS and CPU
-    return thrResults, peakThroughput, rss, peakRss, cpu, startupTime
+    return thrResults, peakThroughput, rssAfterStartup, rss, peakRss, cpu, startupTime, firstResponseTime, rssAtFirstResponse
 
 
 def runBenchmarkIteratively(numIter, jdk, javaOpts):
     # Initialize stats; 2D array of throughput results
     numPulses = numRepetitionsOneClient + numRepetitions50Clients
     thrResults = [] # List of lists
-    rssResults = [] # Just a list
+    rssAfterStartupResults = [] # RSS measured right after startup, before any load
+    rssResults = [] # RSS measured after load (same as rssAfterStartupResults when doApplyLoad=False)
     cpuResults = []
     startupResults = []
+    firstResponseResults = []     # time-to-first-response in ms
+    rssAtFirstResponseResults = [] # RSS at the moment of first HTTP 200 response
 
     # clear SCC if needed (by destroying the SCC volume)
     if doColdRun:
@@ -787,14 +862,22 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
         doMemAnalysis = memAnalysis and iter == numIter - 1
         if doMemAnalysis:
             javaOpts = javaOpts + extraArgsForMemAnalysis
-        thrList, peakThr, rss, peakRss, cpu, startupTime = runBenchmarkOnce(jdk, javaOpts, doMemAnalysis)
+        thrList, peakThr, rssAfterStartup, rss, peakRss, cpu, startupTime, firstResponseTime, rssAtFirstResponse = runBenchmarkOnce(jdk, javaOpts, doMemAnalysis)
         lastThr = meanLastValues(thrList, numMeasurementTrials) # average for last N pulses
-        print(f"Run {iter}: Thr={lastThr:6.1f} RSS={rss:6.1f} MB  PeakRSS={peakRss:6.1f} MB  CPU={cpu:4.1f} sec  Startup={startupTime:5.0f} PeakThr={peakThr:6.1f}".
-              format(lastThr=lastThr, rss=rss, peakRss=peakRss, cpu=cpu, startupTime=startupTime, peakThr=peakThr), flush=True)
+        firstRespStr = f"  FirstResp={firstResponseTime:5.0f} ms  RSS@1st={rssAtFirstResponse:6.1f} MB" if measureFirstResponse else ""
+        if doApplyLoad:
+            print(f"Run {iter}: Thr={lastThr:6.1f} RSSstart={rssAfterStartup:6.1f} MB  RSSload={rss:6.1f} MB  PeakRSS={peakRss:6.1f} MB  CPU={cpu:4.1f} sec  Startup={startupTime:5.0f}{firstRespStr} PeakThr={peakThr:6.1f}".
+                  format(lastThr=lastThr, rssAfterStartup=rssAfterStartup, rss=rss, peakRss=peakRss, cpu=cpu, startupTime=startupTime, peakThr=peakThr), flush=True)
+        else:
+            print(f"Run {iter}: RSS={rssAfterStartup:6.1f} MB  PeakRSS={peakRss:6.1f} MB  CPU={cpu:4.1f} sec  Startup={startupTime:5.0f} ms{firstRespStr}".
+                  format(rssAfterStartup=rssAfterStartup, peakRss=peakRss, cpu=cpu, startupTime=startupTime), flush=True)
         thrResults.append(thrList) # copy all the pulses
+        rssAfterStartupResults.append(rssAfterStartup)
         rssResults.append(rss)
         cpuResults.append(cpu)
         startupResults.append(startupTime)
+        firstResponseResults.append(firstResponseTime)
+        rssAtFirstResponseResults.append(rssAtFirstResponse)
 
     startIter = 0 if (doOnlyColdRuns or not doColdRun) else 1
 
@@ -803,37 +886,49 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     if startIter > 0:
         print("First run is a cold run and is not included in the stats")
     thrAvgResults = [math.nan for i in range(numIter)] # np.full((numIter), fill_value=np.nan, dtype=np.float)
-    for iter in range(numIter):
-        print("Run", iter, end="")
+    if doApplyLoad:
+        for iter in range(numIter):
+            print("Run", iter, end="")
+            for pulse in range(numPulses):
+                print("\t{thr:7.1f}".format(thr=thrResults[iter][pulse]), end="")
+            thrAvgResults[iter] = meanLastValues(thrResults[iter], numMeasurementTrials) #np.nanmean(thrResults[iter][-numMeasurementTrials:])
+            firstRespStr = f"  FirstResp={firstResponseResults[iter]:5.0f} ms  RSS@1st={rssAtFirstResponseResults[iter]:6.1f} MB" if measureFirstResponse else ""
+            print(f"\tAvg={{thr:7.1f}}  RSSstart={{rssstart:7.0f}} MB  RSSload={{rss:7.0f}} MB  CompCPU={{cpu:5.1f}} sec  Startup={{startup:5.0f}} ms{firstRespStr}".
+                  format(thr=thrAvgResults[iter], rssstart=rssAfterStartupResults[iter], rss=rssResults[iter], cpu=cpuResults[iter], startup=startupResults[iter]))
+
+        verticalAverages = []  #verticalAverages = np.nanmean(thrResults, axis=0)
         for pulse in range(numPulses):
-            print("\t{thr:7.1f}".format(thr=thrResults[iter][pulse]), end="")
-        thrAvgResults[iter] = meanLastValues(thrResults[iter], numMeasurementTrials) #np.nanmean(thrResults[iter][-numMeasurementTrials:])
-        print("\tAvg={thr:7.1f}  RSS={rss:7.0f} MB  CompCPU={cpu:5.1f} sec  Startup={startup:5.0f} ms".
-              format(thr=thrAvgResults[iter], rss=rssResults[iter], cpu=cpuResults[iter], startup=startupResults[iter]))
+            total = 0
+            numValidEntries = 0
+            for iter in range(startIter, numIter):
+                if not math.isnan(thrResults[iter][pulse]):
+                    total += thrResults[iter][pulse]
+                    numValidEntries += 1
+            verticalAverages.append(total/numValidEntries if numValidEntries > 0 else math.nan)
 
-    verticalAverages = []  #verticalAverages = np.nanmean(thrResults, axis=0)
-    for pulse in range(numPulses):
-        total = 0
-        numValidEntries = 0
-        for iter in range(startIter, numIter):
-            if not math.isnan(thrResults[iter][pulse]):
-                total += thrResults[iter][pulse]
-                numValidEntries += 1
-        verticalAverages.append(total/numValidEntries if numValidEntries > 0 else math.nan)
+        print("Avg:", end="")
+        for pulse in range(numPulses):
+            print("\t{thr:7.1f}".format(thr=verticalAverages[pulse]), end="")
+        firstRespAvgStr = f"  FirstResp={nanmean(firstResponseResults[startIter:]):5.0f} ms  RSS@1st={nanmean(rssAtFirstResponseResults[startIter:]):6.1f} MB" if measureFirstResponse else ""
+        print(f"\tThr={{avgThr:7.1f}}  RSSstart={{rssstart:7.0f}} MB  RSSload={{rss:7.0f}} MB  CompCPU={{cpu:5.1f}} sec  Startup={{startup:5.0f}} ms{firstRespAvgStr}".
+              format(avgThr=nanmean(thrAvgResults[startIter:]), rssstart=nanmean(rssAfterStartupResults[startIter:]), rss=nanmean(rssResults[startIter:]), cpu=nanmean(cpuResults[startIter:]), startup=nanmean(startupResults[startIter:])))
+        # Throughput stats (load only)
+        avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(thrAvgResults[startIter:], eliminateOutliers=True)
+        print("Throughput stats: Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
+                            format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
+        # RSS@load stats (load only)
+        avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(rssResults[startIter:], eliminateOutliers=True)
+        print("RSS@load:         Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
+                            format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
+    else:
+        for iter in range(numIter):
+            firstRespStr = f"  FirstResp={firstResponseResults[iter]:5.0f} ms  RSS@1st={rssAtFirstResponseResults[iter]:6.1f} MB" if measureFirstResponse else ""
+            print(f"Run {{iter}}  RSS={{rss:7.0f}} MB  CompCPU={{cpu:5.1f}} sec  Startup={{startup:5.0f}} ms{firstRespStr}".
+                  format(iter=iter, rss=rssAfterStartupResults[iter], cpu=cpuResults[iter], startup=startupResults[iter]))
+        firstRespAvgStr = f"  FirstResp={nanmean(firstResponseResults[startIter:]):5.0f} ms  RSS@1st={nanmean(rssAtFirstResponseResults[startIter:]):6.1f} MB" if measureFirstResponse else ""
+        print(f"Avg:  RSS={{rss:7.0f}} MB  CompCPU={{cpu:5.1f}} sec  Startup={{startup:5.0f}} ms{firstRespAvgStr}".
+              format(rss=nanmean(rssAfterStartupResults[startIter:]), cpu=nanmean(cpuResults[startIter:]), startup=nanmean(startupResults[startIter:])))
 
-    print("Avg:", end="")
-    for pulse in range(numPulses):
-        print("\t{thr:7.1f}".format(thr=verticalAverages[pulse]), end="")
-    print("\tThr={avgThr:7.1f}  RSS={rss:7.0f} MB  CompCPU={cpu:5.1f} sec  Startup={startup:5.0f} ms".
-          format(avgThr=nanmean(thrAvgResults[startIter:]), rss=nanmean(rssResults[startIter:]), cpu=nanmean(cpuResults[startIter:]), startup=nanmean(startupResults[startIter:])))
-    # Throughput stats
-    avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(thrAvgResults[startIter:], eliminateOutliers=True)
-    print("Throughput stats: Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
-                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
-    # Footprint stats
-    avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(rssResults[startIter:], eliminateOutliers=True)
-    print("Footprint stats:  Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
-                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
     # CompCPU stats
     avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(cpuResults[startIter:], eliminateOutliers=True)
     print("Comp CPU stats:   Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
@@ -842,6 +937,18 @@ def runBenchmarkIteratively(numIter, jdk, javaOpts):
     avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(startupResults[startIter:], eliminateOutliers=True)
     print("StartupTime stats:Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
                         format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
+    # RSS@startup stats
+    avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(rssAfterStartupResults[startIter:], eliminateOutliers=True)
+    print("RSS@startup:      Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
+                        format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
+    # First-response stats
+    if measureFirstResponse:
+        avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(firstResponseResults[startIter:], eliminateOutliers=True)
+        print("FirstResp stats:  Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
+                            format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
+        avg, stdDev, min, max, ci95, numSamples, outliers = computeStats(rssAtFirstResponseResults[startIter:], eliminateOutliers=True)
+        print("RSS@1stResp:      Avg={avg:7.1f}  StdDev={stdDev:7.1f}  Min={min:7.1f}  Max={max:7.1f}  Max/Min={maxmin:4.0f}% CI95={ci95:7.1f}% numSamples={numSamples:3d}".
+                            format(avg=avg, stdDev=stdDev, min=min, max=max, maxmin=(max-min)*100.0/min, ci95=ci95, numSamples=numSamples))
 
     if jitServerHandle:
         stopJITServer(jitServerHandle)

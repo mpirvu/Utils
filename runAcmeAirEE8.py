@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Python script to run AcmeAirEE8 app in Liberty
 # Liberty is not run in containers. The script should be run on the same machine as the app server
 # Mongo and JMeter are run in containers. Both docker and podman should work.
@@ -45,6 +46,7 @@ extraArgsForMemAnalysis = f" -Dcom.ibm.dbgmalloc=true -Xdump:none -Xdump:system:
 # Also you must ensure that "perf" is installed and the user has the rights to collect such a profile   sudo sh -c " echo 0 >  /proc/sys/kernel/perf_event_paranoid"
 collectPerfProfileForJIT = False # Collect perf profile of the "main" compilation thread
 collectPerfProfileForJVM = False  # Collect perf profile for the entire JVM
+collectPerfProfileForHotspot = False # Needs collectPerfProfileForJVM to be true as well
 perfProfileOutput = "/tmp/perf.data"
 #perfCmd= f"perf record -e cycles -c 200000"
 perfCmd= f"perf record -e task-clock"
@@ -406,13 +408,18 @@ def collectJITPerfProfile(javaPID):
     logging.info("Collecting JIT perf profile in the background for TID={tid} with cmd={cmd}".format(tid=compThreadTID, cmd=cmd))
     return perfProcess
 
-def collectJVMPerfProfile(javaPID):
+def collectJVMPerfProfile(javaPID, jdk):
     perfProcess = None
     outputFile = f"{perfProfileOutput}.{javaPID}"
     cmd = f"{perfCmd} -o {outputFile} --pid {javaPID} --delay=20000 -- sleep {perfDuration}"
     try:
         # Fork a process and run in background
         perfProcess = subprocess.Popen(shlex.split(cmd), universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if collectPerfProfileForHotspot:
+            cmd1 = f"{jdk}/bin/jcmd {javaPID} Compiler.perfmap"
+            logging.info("Generating code cache symbols with cmd: {cmd1}".format(cmd1=cmd1))
+            output1 = subprocess.check_output(shlex.split(cmd1), universal_newlines=True, stderr=subprocess.STDOUT)
+            logging.info(output1)
         # This process will run for the specified amount of time (perfDuration) and then end
     except subprocess.CalledProcessError as e:
         logging.error("CalledProcessError calling perf record: {e}".format(e=e))
@@ -803,7 +810,7 @@ def runBenchmarkOnce(jdk, jvmArgs, doMemAnalysis):
             # If enabled, start the JVM profiling thread in the background
             if collectPerfProfileForJVM and pulse == maxPulses-1:
                 if childProcess.poll() is None: # Still running:
-                    collectJVMPerfProfile(childProcess.pid)
+                    collectJVMPerfProfile(childProcess.pid, jdk)
                 else:
                     logging.error("Failed to start JVM perf profiling because Java process has terminated")
 
